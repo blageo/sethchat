@@ -15,7 +15,6 @@ func main() {
 		log.Fatal("dial error:", err)
 	}
 
-	//fmt.Printf("http response:", res)	// debugging for http response content
 	defer conn.Close()
 
 	fmt.Println("connected to server")
