@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -9,8 +10,17 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+var user string
+
 func main() {
-	conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:8080/ws", nil)
+	// parse flags
+	flag.StringVar(&user, "user", "", "your username")
+	flag.Parse()
+	if user == "" {
+		log.Fatal("user is required")
+	}
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:8080/ws?user="+user, nil)
 	if err != nil {
 		log.Fatal("dial error:", err)
 	}
@@ -27,7 +37,7 @@ func main() {
 				log.Println("disconnected:", err)
 				os.Exit(0)
 			}
-			fmt.Println("server:", string(message))
+			fmt.Println(string(message))
 		}
 	}()
 
