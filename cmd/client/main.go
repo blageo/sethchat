@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"sethchat/internal/protocol"
 
 	"github.com/gorilla/websocket"
 )
@@ -32,12 +34,19 @@ func main() {
 	// asyncly prints incoming messages
 	go func() {
 		for {
-			_, message, err := conn.ReadMessage()
+			_, mes, err := conn.ReadMessage()
 			if err != nil {
 				log.Println("disconnected:", err)
 				os.Exit(0)
 			}
-			fmt.Println(string(message))
+			message := protocol.Message{}
+			err = json.Unmarshal(mes, &message)
+			if err != nil {
+				log.Println("unmarshaling error:", err)
+				continue
+			}
+
+			printMessage(message)
 		}
 	}()
 
@@ -49,5 +58,14 @@ func main() {
 			log.Println("write error", err)
 			return
 		}
+	}
+}
+
+func printMessage(message protocol.Message) {
+	if message.Type == protocol.TypeSystem {
+		fmt.Println(message.Content)
+	}
+	if message.Type == protocol.TypeChat {
+		fmt.Println(message.Sender + ": " + message.Content)
 	}
 }

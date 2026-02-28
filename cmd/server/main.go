@@ -1,10 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"sync"
+
+	"sethchat/internal/protocol"
 
 	"github.com/gorilla/websocket"
 )
@@ -20,7 +23,7 @@ var upgrader = websocket.Upgrader{
 
 // Need a hub to collect client connections and broadcast
 type Hub struct {
-	// Registered clients.
+	// Registered clients. string will be username provided at connection
 	clients map[*websocket.Conn]string
 	mu      sync.Mutex
 }
@@ -37,12 +40,17 @@ func (h *Hub) remove(conn *websocket.Conn) {
 	delete(h.clients, conn)
 }
 
-func (h *Hub) broadcast(message []byte, sender *websocket.Conn) {
+func (h *Hub) broadcast(message protocol.Message, sender *websocket.Conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for conn := range h.clients {
 		if conn != sender {
-			err := conn.WriteMessage(websocket.TextMessage, []byte(h.clients[sender]+": "+string(message)))
+			mes, err := json.Marshal(message)
+			if err != nil {
+				log.Println("marshal error:", err)
+				continue
+			}
+			err = conn.WriteMessage(websocket.TextMessage, mes)
 			if err != nil {
 				log.Println("write error:", err)
 			}
@@ -70,17 +78,26 @@ func handleConnection(w http.ResponseWriter, r *http.Request) {
 	hub.add(conn, user)
 	defer hub.remove(conn)
 
+	welcomeMessage := protocol.Message{Type: protocol.TypeSystem, Content: fmt.Sprintf("*** %s connected ***", user)}
 	log.Printf("client connected with username: %s", user)
-	hub.broadcast([]byte(fmt.Sprintf("*** %s joined ***", user)), conn)
+	hub.broadcast(welcomeMessage, conn)
 	for {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			log.Printf("client disconnected with username: %s, error: %v", hub.clients[conn], err)
+			disconnectMessage := protocol.Message{Type: protocol.TypeSystem, Content: fmt.Sprintf("*** %s disconnected ***", user)}
+			hub.broadcast(disconnectMessage, conn)
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("unexpected error for %s: %v", user, err)
+			} else {
+				log.Printf("%s disconnected", user)
+			}
 			return
 		}
 
+		chatMessage := protocol.Message{Type: protocol.TypeChat, Sender: user, Content: string(message)}
+
 		log.Printf("received from %s: %s", hub.clients[conn], message)
-		hub.broadcast(message, conn)
+		hub.broadcast(chatMessage, conn)
 	}
 }
 
