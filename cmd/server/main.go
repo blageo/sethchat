@@ -12,23 +12,19 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Upgrader is how HTTP requests are upgraded to websockets. GET request with extra headers
 var upgrader = websocket.Upgrader{
-	// This is for checking origin of connections in browser against whitelist
-	// Since this is terminal based we will allow all?
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
 }
 
-// Need a hub to collect client connections and broadcast
+// Hub manages all active WebSocket connections, organized by room.
 type Hub struct {
-	// Registered clients. rooms mapped to conns mapped to user string
-	clients map[string]map[*websocket.Conn]string
-	mu      sync.Mutex
+	clients map[string]map[*websocket.Conn]string // room -> conn -> username
+	mu      sync.RWMutex
 }
 
-func (h *Hub) addToRoom(conn *websocket.Conn, user string, room string) {
+func (h *Hub) addToRoom(conn *websocket.Conn, user, room string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.clients[room] == nil {
@@ -43,6 +39,20 @@ func (h *Hub) removeFromRoom(conn *websocket.Conn, room string) {
 	delete(h.clients[room], conn)
 }
 
+// roomsForConn returns all rooms the given connection is currently in.
+// Caller must not hold h.mu.
+func (h *Hub) roomsForConn(conn *websocket.Conn) []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	var rooms []string
+	for room, conns := range h.clients {
+		if _, ok := conns[conn]; ok {
+			rooms = append(rooms, room)
+		}
+	}
+	return rooms
+}
+
 func (h *Hub) removeFromAll(conn *websocket.Conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -52,66 +62,68 @@ func (h *Hub) removeFromAll(conn *websocket.Conn) {
 }
 
 func (h *Hub) broadcastToRoom(message protocol.Message, sender *websocket.Conn, room string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	log.Printf("broadcasting to room %s, %d clients", room, len(h.clients[room]))
 	mes, err := json.Marshal(message)
 	if err != nil {
 		log.Println("marshal error:", err)
 		return
 	}
+
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	log.Printf("broadcasting to room %s, %d clients", room, len(h.clients[room]))
 	for conn := range h.clients[room] {
-		if conn != sender {
-			err = conn.WriteMessage(websocket.TextMessage, mes)
-			if err != nil {
-				log.Println("write error:", err)
-			}
+		if conn == sender {
+			continue
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, mes); err != nil {
+			log.Println("write error:", err)
 		}
 	}
 }
 
 var hub = Hub{clients: make(map[string]map[*websocket.Conn]string)}
 
-// handler function that gets passed to http.HandleFunc()
 func handleConnection(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		fmt.Println("upgrade error:", err)
+		log.Println("upgrade error:", err)
 		return
 	}
 	defer conn.Close()
 
-	// add a hub to handle connections and broadcasting and save user
 	user := r.URL.Query().Get("user")
 	if user == "" {
-		log.Println("user is required")
+		log.Println("rejected connection: user param required")
 		return
 	}
-	// extract room from cli and apply general room if omitted
 	room := r.URL.Query().Get("room")
 	if room == "" {
 		room = "general"
 	}
+
 	hub.addToRoom(conn, user, room)
 	defer hub.removeFromAll(conn)
 
-	welcomeMessage := protocol.Message{Type: protocol.TypeSystem, Content: fmt.Sprintf("*** %s connected to %s***", user, room)}
-	log.Printf("client connected with username: %s", user)
+	welcomeMessage := protocol.Message{
+		Type:    protocol.TypeSystem,
+		Content: fmt.Sprintf("*** %s connected to %s ***", user, room),
+	}
 	hub.broadcastToRoom(welcomeMessage, conn, room)
+	log.Printf("client connected: %s in %s", user, room)
 
-	// Read Loop
 	for {
-		_, message, err := conn.ReadMessage()
+		_, raw, err := conn.ReadMessage()
 		if err != nil {
-			disconnectMessage := protocol.Message{Type: protocol.TypeSystem, Content: fmt.Sprintf("*** %s disconnected ***", user)}
-			// loop over rooms
-			for rm := range hub.clients {
-				_, ok := hub.clients[rm][conn] // check for conn in room
-				if ok {
-					hub.broadcastToRoom(disconnectMessage, conn, rm) // broadcast disconnect to room if conn was present
-				}
+			// Snapshot rooms before removing conn so we can notify them.
+			rooms := hub.roomsForConn(conn)
+			disconnectMessage := protocol.Message{
+				Type:    protocol.TypeSystem,
+				Content: fmt.Sprintf("*** %s disconnected ***", user),
 			}
-			// server logging expected close errors include interupt signals and closing browser tabs etc.
+			for _, rm := range rooms {
+				hub.broadcastToRoom(disconnectMessage, conn, rm)
+			}
+
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("unexpected error for %s: %v", user, err)
 			} else {
@@ -120,50 +132,47 @@ func handleConnection(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		handleMessage(message, conn)
-		// chatMessage := protocol.Message{Type: protocol.TypeChat, Sender: user, Content: string(message)}
-
-		// log.Printf("received from %s: %s", hub.clients[room][conn], message)
-		// hub.broadcastToRoom(chatMessage, conn, room)
+		handleMessage(raw, conn)
 	}
 }
 
-func handleMessage(mes []byte, conn *websocket.Conn) {
-	message := protocol.Message{}
-	err := json.Unmarshal(mes, &message)
-	if err != nil {
-		log.Printf("unmarshal error: %v | raw: %q", err, string(mes)) // log raw bytes
+func handleMessage(raw []byte, conn *websocket.Conn) {
+	var message protocol.Message
+	if err := json.Unmarshal(raw, &message); err != nil {
+		log.Printf("unmarshal error: %v | raw: %q", err, string(raw))
 		return
 	}
+
 	switch message.Type {
 	case protocol.TypeSystem:
-		log.Println("This is a system message")
+		log.Println("received system message (ignored)")
+
 	case protocol.TypeChat:
-		// log.Printf("chat received from %s: %s", message.Sender, message)
 		hub.broadcastToRoom(message, conn, message.Room)
+
 	case protocol.TypeJoinRoom:
 		hub.addToRoom(conn, message.Sender, message.Room)
-		joinMessage := protocol.Message{
+		hub.broadcastToRoom(protocol.Message{
 			Type:    protocol.TypeSystem,
 			Room:    message.Room,
 			Content: fmt.Sprintf("%s joined the room", message.Sender),
-		}
-		hub.broadcastToRoom(joinMessage, conn, message.Room)
+		}, conn, message.Room)
+
 	case protocol.TypeLeaveRoom:
 		hub.removeFromRoom(conn, message.Room)
-		leaveMessage := protocol.Message{
+		hub.broadcastToRoom(protocol.Message{
 			Type:    protocol.TypeSystem,
 			Room:    message.Room,
 			Content: fmt.Sprintf("%s left the room", message.Sender),
-		}
-		hub.broadcastToRoom(leaveMessage, conn, message.Room)
-	}
+		}, conn, message.Room)
 
+	default:
+		log.Printf("unknown message type: %q", message.Type)
+	}
 }
 
 func main() {
 	http.HandleFunc("/ws", handleConnection)
-
 	fmt.Println("server listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

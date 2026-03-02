@@ -12,85 +12,77 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var user string
-var room string
+var (
+	user string
+	room string
+)
 
 func main() {
-	// parse flags
-	flag.StringVar(&user, "user", "", "your username")
-	flag.StringVar(&room, "room", "", "room")
+	flag.StringVar(&user, "user", "", "your username (required)")
+	flag.StringVar(&room, "room", "general", "chat room to join")
 	flag.Parse()
+
 	if user == "" {
-		log.Fatal("user is required")
-	}
-	if room == "" {
-		room = "general"
+		log.Fatal("--user is required")
 	}
 
-	conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:8080/ws?user="+user, nil)
+	url := fmt.Sprintf("ws://localhost:8080/ws?user=%s&room=%s", user, room)
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
 		log.Fatal("dial error:", err)
 	}
-
 	defer conn.Close()
 
-	fmt.Println("connected to server")
+	fmt.Printf("connected to server as %s in #%s\n", user, room)
 
-	// join room after connecting
-	if room != "" {
-		joinMsg := protocol.Message{
-			Type:   protocol.TypeJoinRoom,
-			Sender: user,
-			Room:   room,
-		}
-		bytes, err := json.Marshal(joinMsg)
-		if err != nil {
-			log.Fatal("marshal error:", err)
-		}
-		err = conn.WriteMessage(websocket.TextMessage, bytes)
-		if err != nil {
-			log.Fatal("join error:", err)
-		}
+	joinMsg := protocol.Message{
+		Type:   protocol.TypeJoinRoom,
+		Sender: user,
+		Room:   room,
+	}
+	if err := sendMessage(conn, joinMsg); err != nil {
+		log.Fatal("join error:", err)
 	}
 
-	// asyncly prints incoming messages
+	// Receive messages in background.
 	go func() {
 		for {
-			_, mes, err := conn.ReadMessage()
+			_, raw, err := conn.ReadMessage()
 			if err != nil {
 				log.Println("disconnected:", err)
 				os.Exit(0)
 			}
-			message := protocol.Message{}
-			err = json.Unmarshal(mes, &message)
-			if err != nil {
-				log.Printf("unmarshal error: %v | raw: %q", err, string(mes)) // log raw bytes
+			var message protocol.Message
+			if err := json.Unmarshal(raw, &message); err != nil {
+				log.Printf("unmarshal error: %v | raw: %q", err, string(raw))
 				continue
 			}
 			printMessage(message)
 		}
 	}()
 
-	// read from stdin and send
+	// Send messages from stdin.
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		msg := protocol.Message{
 			Type:    protocol.TypeChat,
 			Sender:  user,
-			Room:    room, // whatever room flag you're using
+			Room:    room,
 			Content: scanner.Text(),
 		}
-		bytes, err := json.Marshal(msg)
-		if err != nil {
-			log.Println("marshal error:", err)
-			continue
-		}
-		err = conn.WriteMessage(websocket.TextMessage, bytes)
-		if err != nil {
+		if err := sendMessage(conn, msg); err != nil {
 			log.Println("write error:", err)
 			return
 		}
 	}
+}
+
+func sendMessage(conn *websocket.Conn, msg protocol.Message) error {
+	bytes, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	return conn.WriteMessage(websocket.TextMessage, bytes)
 }
 
 func printMessage(message protocol.Message) {
