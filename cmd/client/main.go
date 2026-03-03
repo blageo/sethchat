@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"sethchat/internal/protocol"
+	"strings"
 
 	"github.com/gorilla/websocket"
 )
@@ -34,13 +35,9 @@ func main() {
 	defer conn.Close()
 
 	fmt.Printf("connected to server as %s in #%s\n", user, room)
+	fmt.Println("commands: /join <room>, /leave, /room")
 
-	joinMsg := protocol.Message{
-		Type:   protocol.TypeJoinRoom,
-		Sender: user,
-		Room:   room,
-	}
-	if err := sendMessage(conn, joinMsg); err != nil {
+	if err := joinRoom(conn, room); err != nil {
 		log.Fatal("join error:", err)
 	}
 
@@ -64,17 +61,95 @@ func main() {
 	// Send messages from stdin.
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
+		text := scanner.Text()
+		if strings.HasPrefix(text, "/") {
+			handleCommand(conn, text)
+			continue
+		}
+		if room == "" {
+			fmt.Println("not in a room. use /join <room>")
+			continue
+		}
 		msg := protocol.Message{
 			Type:    protocol.TypeChat,
 			Sender:  user,
 			Room:    room,
-			Content: scanner.Text(),
+			Content: text,
 		}
 		if err := sendMessage(conn, msg); err != nil {
 			log.Println("write error:", err)
 			return
 		}
 	}
+}
+
+func handleCommand(conn *websocket.Conn, input string) {
+	parts := strings.Fields(input)
+	if len(parts) == 0 {
+		return
+	}
+
+	switch parts[0] {
+	case "/join":
+		if len(parts) < 2 {
+			fmt.Println("usage: /join <room>")
+			return
+		}
+		newRoom := parts[1]
+		if newRoom == room {
+			fmt.Printf("already in #%s\n", room)
+			return
+		}
+		if room != "" {
+			if err := leaveRoom(conn, room); err != nil {
+				log.Println("leave error:", err)
+				return
+			}
+		}
+		if err := joinRoom(conn, newRoom); err != nil {
+			log.Println("join error:", err)
+			return
+		}
+		room = newRoom
+
+	case "/leave":
+		if room == "" {
+			fmt.Println("not currently in a room")
+			return
+		}
+		if err := leaveRoom(conn, room); err != nil {
+			log.Println("leave error:", err)
+			return
+		}
+		room = ""
+		fmt.Println("left room. use /join <room> to rejoin")
+
+	case "/room":
+		if room == "" {
+			fmt.Println("not currently in a room")
+		} else {
+			fmt.Printf("current room: #%s\n", room)
+		}
+
+	default:
+		fmt.Printf("unknown command %q. commands: /join <room>, /leave, /room\n", parts[0])
+	}
+}
+
+func joinRoom(conn *websocket.Conn, r string) error {
+	return sendMessage(conn, protocol.Message{
+		Type:   protocol.TypeJoinRoom,
+		Sender: user,
+		Room:   r,
+	})
+}
+
+func leaveRoom(conn *websocket.Conn, r string) error {
+	return sendMessage(conn, protocol.Message{
+		Type:   protocol.TypeLeaveRoom,
+		Sender: user,
+		Room:   r,
+	})
 }
 
 func sendMessage(conn *websocket.Conn, msg protocol.Message) error {
