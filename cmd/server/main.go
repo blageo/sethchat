@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"sethchat/internal/protocol"
 
@@ -72,13 +73,18 @@ func (h *Hub) broadcastToRoom(message protocol.Message, sender *websocket.Conn, 
 	defer h.mu.RUnlock()
 	log.Printf("broadcasting to room %s, %d clients", room, len(h.clients[room]))
 	for conn := range h.clients[room] {
-		if conn == sender {
-			continue
-		}
 		if err := conn.WriteMessage(websocket.TextMessage, mes); err != nil {
 			log.Println("write error:", err)
 		}
 	}
+}
+
+// stamp sets the message timestamp to now if one hasn't been set already.
+func stamp(m protocol.Message) protocol.Message {
+	if m.Timestamp.IsZero() {
+		m.Timestamp = time.Now().UTC()
+	}
+	return m
 }
 
 var hub = Hub{clients: make(map[string]map[*websocket.Conn]string)}
@@ -104,22 +110,21 @@ func handleConnection(w http.ResponseWriter, r *http.Request) {
 	hub.addToRoom(conn, user, room)
 	defer hub.removeFromAll(conn)
 
-	welcomeMessage := protocol.Message{
+	welcomeMessage := stamp(protocol.Message{
 		Type:    protocol.TypeSystem,
 		Content: fmt.Sprintf("*** %s connected to %s ***", user, room),
-	}
+	})
 	hub.broadcastToRoom(welcomeMessage, conn, room)
 	log.Printf("client connected: %s in %s", user, room)
 
 	for {
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
-			// Snapshot rooms before removing conn so we can notify them.
 			rooms := hub.roomsForConn(conn)
-			disconnectMessage := protocol.Message{
+			disconnectMessage := stamp(protocol.Message{
 				Type:    protocol.TypeSystem,
 				Content: fmt.Sprintf("*** %s disconnected ***", user),
-			}
+			})
 			for _, rm := range rooms {
 				hub.broadcastToRoom(disconnectMessage, conn, rm)
 			}
@@ -143,6 +148,9 @@ func handleMessage(raw []byte, conn *websocket.Conn) {
 		return
 	}
 
+	// Always stamp on arrival so the server is the authority on time.
+	message = stamp(message)
+
 	switch message.Type {
 	case protocol.TypeSystem:
 		log.Println("received system message (ignored)")
@@ -152,19 +160,19 @@ func handleMessage(raw []byte, conn *websocket.Conn) {
 
 	case protocol.TypeJoinRoom:
 		hub.addToRoom(conn, message.Sender, message.Room)
-		hub.broadcastToRoom(protocol.Message{
+		hub.broadcastToRoom(stamp(protocol.Message{
 			Type:    protocol.TypeSystem,
 			Room:    message.Room,
 			Content: fmt.Sprintf("%s joined the room", message.Sender),
-		}, conn, message.Room)
+		}), conn, message.Room)
 
 	case protocol.TypeLeaveRoom:
 		hub.removeFromRoom(conn, message.Room)
-		hub.broadcastToRoom(protocol.Message{
+		hub.broadcastToRoom(stamp(protocol.Message{
 			Type:    protocol.TypeSystem,
 			Room:    message.Room,
 			Content: fmt.Sprintf("%s left the room", message.Sender),
-		}, conn, message.Room)
+		}), conn, message.Room)
 
 	default:
 		log.Printf("unknown message type: %q", message.Type)
@@ -174,5 +182,6 @@ func handleMessage(raw []byte, conn *websocket.Conn) {
 func main() {
 	http.HandleFunc("/ws", handleConnection)
 	fmt.Println("server listening on :8080")
+	http.Handle("/", http.FileServer(http.Dir("./web")))
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

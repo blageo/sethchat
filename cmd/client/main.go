@@ -161,10 +161,14 @@ func sendMessage(conn *websocket.Conn, msg protocol.Message) error {
 }
 
 func printMessage(message protocol.Message) {
+	ts := ""
+	if !message.Timestamp.IsZero() {
+		ts = fmt.Sprintf("[%s] ", message.Timestamp.Local().Format("15:04:05"))
+	}
 	switch message.Type {
 	case protocol.TypeSystem:
-		fmt.Println(message.Content)
+		fmt.Printf("%s%s\n", ts, message.Content)
 	case protocol.TypeChat:
-		fmt.Printf("[%s] %s: %s\n", message.Room, message.Sender, message.Content)
+		fmt.Printf("%s[%s] %s: %s\n", ts, message.Room, message.Sender, message.Content)
 	}
 }

@@ -1,6 +1,6 @@
-// Package protocol defines the shared message types used between the
-// sethchat server and client over WebSocket.
 package protocol
+
+import "time"
 
 // MessageType distinguishes the purpose of a Message.
 type MessageType string
@@ -14,8 +14,9 @@ const (
 
 // Message is the common envelope for all WebSocket communication.
 type Message struct {
-	Type    MessageType `json:"type"`
-	Room    string      `json:"room"`
-	Sender  string      `json:"sender,omitempty"`
-	Content string      `json:"content"`
+	Type      MessageType `json:"type"`
+	Room      string      `json:"room"`
+	Sender    string      `json:"sender,omitempty"`
+	Content   string      `json:"content"`
+	Timestamp time.Time   `json:"timestamp"`
 }

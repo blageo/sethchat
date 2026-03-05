@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sethchat</title>
+    <style>
+        .hidden {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <form id="loginForm">
+        <h1>Welcome to Sethchat</h1>
+        <p>Please be aware that communications on this platform are not yet encrypted end to end. Communicate with caution.</p>
+        <label for="username">Username:</label>
+        <input type="text" id="username" name="username" required>
+        <br>
+        <label for="room">Room:</label>
+        <input type="text" id="room" name="room" required>
+        <br>
+        <button type="submit">Login</button>
+    </form>
+    <div id="chatContainer" class ="hidden">
+        <h2>Chat Room</h2>
+        <div id="messageList"></div>
+        <div id="inputBar">
+            <input type="text" id="messageInput" placeholder="Type your message here...">
+            <button id="sendButton">Send</button>
+        </div>
+    </div>
+    <script>
+        const loginForm = document.getElementById('loginForm')
+        const chatContainer = document.getElementById('chatContainer')
+        const messageList = document.getElementById('messageList')
+        const messageInput = document.getElementById('messageInput')
+        const sendButton = document.getElementById('sendButton')
+        let conn = null
+        let user = null
+        let room = null
+
+        loginForm.addEventListener('submit', function(event) {
+            event.preventDefault()
+            
+            user = document.getElementById('username').value
+            room = document.getElementById('room').value
+            conn = new WebSocket(`ws://${window.location.host}/ws?user=${user}&room=${room}`)
+            conn.onopen = function() {
+                console.log('Connection established')
+            }
+            conn.onclose = function() {
+                console.log('Connection closed')
+            }
+            conn.onmessage = function(event) {
+                const message = JSON.parse(event.data)
+                const messageElement = document.createElement('div')
+                let timestamp = new Date(message.timestamp).toLocaleTimeString()
+                if (message.type === "chat") {
+                    messageElement.textContent = `${timestamp} [${message.room}] ${message.sender}: ${message.content}`
+                }
+                if (message.type === "system") {
+                    messageElement.textContent = `${timestamp} [System] ${message.content}`
+                }
+                if (message.sender === user) {
+                    messageElement.classList.add('own-message')
+                }
+                messageList.appendChild(messageElement)
+            }
+
+            console.log(user, room)
+            loginForm.classList.add('hidden')
+            chatContainer.classList.remove('hidden')
+            
+        })
+        sendButton.addEventListener('click', function() {
+            const content = messageInput.value
+            if (content && conn) {
+                const message = {
+                    type: 'chat',
+                    content: content,
+                    room: room,
+                    sender: user,
+                }
+                conn.send(JSON.stringify(message))
+                messageInput.value = ''
+            }
+        })
+        messageInput.addEventListener('keypress', function(event) {
+            if (event.key === 'Enter') {
+                sendButton.click()
+            }
+        })
+    </script>
+</body>
+</html>
