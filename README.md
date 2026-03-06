@@ -25,16 +25,14 @@ sethchat/
 │   └── client/
 │       └── main.go            # CLI client entry point
 ├── internal/
-│   ├── protocol/
-│   │   └── messages.go        # Shared message types
-│   ├── server/
-│   │   └── server.go          # Server logic
-│   └── client/
-│       └── client.go          # Client logic
+│   └── protocol/
+│       └── messages.go        # Shared message types
 └── web/
     ├── index.html             # Browser client
-    ├── style.css              # Styling
-    └── script.js              # Client-side logic
+    ├── css/
+    │   └── style.css          # Styling
+    └── js/
+        └── script.js          # Client-side logic
 
 ```
 
