@@ -37,7 +37,6 @@ sethchat/
     └── script.js              # Client-side logic
 
 ```
-```
 
 ## Getting Started
 
