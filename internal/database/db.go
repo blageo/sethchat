@@ -40,6 +40,12 @@ func Open(path string) (*sql.DB, error) {
 		expires_at TEXT,
 		FOREIGN KEY (user_id) REFERENCES users(user_id)
 	);
+	CREATE TABLE IF NOT EXISTS user_rooms (
+		user_id   INTEGER NOT NULL,
+		room_name TEXT    NOT NULL,
+		PRIMARY KEY (user_id, room_name),
+		FOREIGN KEY (user_id) REFERENCES users(user_id)
+	);
 	`)
 
 	if err != nil {

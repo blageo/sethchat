@@ -1,19 +1,25 @@
-        const loginForm     = document.getElementById('loginForm')
-        const chatContainer = document.getElementById('chatContainer')
-        const messageList   = document.getElementById('messageList')
-        const messageInput  = document.getElementById('messageInput')
-        const sendButton    = document.getElementById('sendButton')
-        const headerRoom    = document.getElementById('headerRoom')
-        const headerUser    = document.getElementById('headerUser')
+        const loginForm      = document.getElementById('loginForm')
+        const chatContainer  = document.getElementById('chatContainer')
+        const messageList    = document.getElementById('messageList')
+        const messageInput   = document.getElementById('messageInput')
+        const sendButton     = document.getElementById('sendButton')
+        const headerRoom     = document.getElementById('headerRoom')
+        const headerUser     = document.getElementById('headerUser')
         const passwordInput  = document.getElementById('password')
         const loginError     = document.getElementById('loginError')
         const toggleRegister = document.getElementById('toggleRegister')
+        const addRoomInput   = document.getElementById('addRoomInput')
+        const addRoomButton  = document.getElementById('addRoomButton')
 
-        let conn = null
-        let user = null
-        let room = null
-        let sessionId = null
+        let conn           = null
+        let user           = null
+        let sessionId      = null
+        let activeRoom     = null          // currently displayed room name
+        const messages     = {}           // { [roomName]: Message[] }
+        const joinedRooms  = new Set()    // insertion-ordered set of joined rooms
         let isRegisterMode = false
+
+        // ── Login / Register ──────────────────────────────
 
         toggleRegister.addEventListener('click', function(e) {
             e.preventDefault()
@@ -29,7 +35,6 @@
 
             const username = document.getElementById('username').value.trim()
             const password = passwordInput.value
-            room = document.getElementById('room').value.trim()
 
             if (isRegisterMode) {
                 const res = await fetch('/register', {
@@ -58,15 +63,27 @@
             sessionId = data.session_id
             user = username
 
-            conn = new WebSocket(`ws://${window.location.host}/ws?session=${sessionId}&room=${room}`)
+            conn = new WebSocket(`ws://${window.location.host}/ws?session=${sessionId}`)
 
-            conn.onopen = function() {
+            conn.onopen = async function() {
                 console.log('Connection established')
-                headerRoom.textContent = room
                 headerUser.textContent = user
                 loginForm.classList.add('hidden')
                 chatContainer.classList.remove('hidden')
-                messageInput.focus()
+
+                // Restore saved rooms from the server, then join each one.
+                const roomsRes = await fetch(`/rooms?session=${sessionId}`)
+                const roomsData = await roomsRes.json()
+                for (const roomName of roomsData.rooms) {
+                    await joinRoom(roomName)
+                }
+
+                // If no saved rooms, focus the add-room input to prompt the user.
+                if (joinedRooms.size === 0) {
+                    addRoomInput.focus()
+                } else {
+                    messageInput.focus()
+                }
             }
 
             conn.onclose = function() {
@@ -75,11 +92,112 @@
 
             conn.onmessage = function(event) {
                 const message = JSON.parse(event.data)
-                appendMessage(message)
+                // Route message to its room bucket; fall back to activeRoom for
+                // any server messages that don't carry a room field.
+                const msgRoom = message.room || activeRoom
+                if (!msgRoom) return
+                if (!messages[msgRoom]) messages[msgRoom] = []
+                messages[msgRoom].push(message)
+                // Only render to DOM if the message belongs to the visible room.
+                if (msgRoom === activeRoom) {
+                    appendMessageToDOM(message, messageList)
+                }
             }
         })
 
-        function appendMessage(message) {
+        // ── Room management ───────────────────────────────
+
+        // joinRoom persists the room to the server, sends a WS joinRoom message,
+        // and updates local state + sidebar. Idempotent: switching to an already-
+        // joined room just calls switchToRoom.
+        async function joinRoom(roomName) {
+            if (joinedRooms.has(roomName)) {
+                switchToRoom(roomName)
+                return
+            }
+            await fetch(`/rooms?session=${sessionId}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ room: roomName }),
+            })
+            conn.send(JSON.stringify({ type: 'joinRoom', room: roomName }))
+            joinedRooms.add(roomName)
+            messages[roomName] = []
+            renderSidebar()
+            if (activeRoom === null) switchToRoom(roomName)
+        }
+
+        // leaveRoom removes the room from the server, sends a WS leaveRoom message,
+        // and updates local state + sidebar. If the active room is left, auto-
+        // switches to the next available room (or clears the message pane).
+        async function leaveRoom(roomName) {
+            await fetch(`/rooms?session=${sessionId}`, {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ room: roomName }),
+            })
+            conn.send(JSON.stringify({ type: 'leaveRoom', room: roomName }))
+            joinedRooms.delete(roomName)
+            delete messages[roomName]
+            renderSidebar()
+            if (activeRoom === roomName) {
+                const remaining = [...joinedRooms]
+                activeRoom = remaining.length > 0 ? remaining[0] : null
+                if (activeRoom) {
+                    switchToRoom(activeRoom)
+                } else {
+                    headerRoom.textContent = ''
+                    messageList.innerHTML = ''
+                }
+            }
+        }
+
+        // switchToRoom updates the active room, header, sidebar highlight, and
+        // re-renders the message list from the stored history for that room.
+        function switchToRoom(roomName) {
+            activeRoom = roomName
+            headerRoom.textContent = roomName
+            renderSidebar()
+            renderMessageList()
+        }
+
+        // ── Rendering ─────────────────────────────────────
+
+        // renderSidebar rebuilds the #roomList element from the joinedRooms Set.
+        function renderSidebar() {
+            const list = document.getElementById('roomList')
+            list.innerHTML = ''
+            for (const name of joinedRooms) {
+                const item = document.createElement('div')
+                item.className = 'room-item' + (name === activeRoom ? ' active' : '')
+                item.innerHTML = `
+                    <span class="room-hash">#</span>
+                    <span class="room-label">${escapeHtml(name)}</span>
+                    <button class="leave-btn" title="leave">✕</button>
+                `
+                item.querySelector('.room-label').addEventListener('click', () => switchToRoom(name))
+                item.querySelector('.room-hash').addEventListener('click', () => switchToRoom(name))
+                item.querySelector('.leave-btn').addEventListener('click', e => {
+                    e.stopPropagation()
+                    leaveRoom(name)
+                })
+                list.appendChild(item)
+            }
+        }
+
+        // renderMessageList replaces the full #messageList DOM from stored history.
+        // Used when switching rooms.
+        function renderMessageList() {
+            messageList.innerHTML = ''
+            if (!activeRoom || !messages[activeRoom]) return
+            for (const msg of messages[activeRoom]) {
+                appendMessageToDOM(msg, messageList)
+            }
+            messageList.lastElementChild?.scrollIntoView({ behavior: 'instant', block: 'end' })
+        }
+
+        // appendMessageToDOM creates and appends a message element to container.
+        function appendMessageToDOM(message, container) {
             const el = document.createElement('div')
             const ts = message.timestamp
                 ? new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
@@ -90,7 +208,7 @@
                 el.classList.add('message', isOwn ? 'own' : 'theirs')
                 el.innerHTML = `
                     <div class="meta">
-                        <span class="sender">${message.sender}</span>
+                        <span class="sender">${escapeHtml(message.sender)}</span>
                         <span class="ts">${ts}</span>
                     </div>
                     <div class="body">${escapeHtml(message.content)}</div>
@@ -100,21 +218,44 @@
                 el.textContent = message.content
             }
 
-            messageList.appendChild(el)
+            container.appendChild(el)
             el.scrollIntoView({ behavior: 'smooth', block: 'end' })
         }
 
+        // ── Sending messages ──────────────────────────────
+
         function sendChat() {
             const content = messageInput.value.trim()
-            if (!content || !conn) return
+            if (!content || !conn || !activeRoom) return
             conn.send(JSON.stringify({
                 type:    'chat',
                 sender:  user,
-                room:    room,
+                room:    activeRoom,
                 content: content,
             }))
             messageInput.value = ''
         }
+
+        sendButton.addEventListener('click', sendChat)
+        messageInput.addEventListener('keydown', function(event) {
+            if (event.key === 'Enter') sendChat()
+        })
+
+        // ── Add-room UI ───────────────────────────────────
+
+        addRoomButton.addEventListener('click', addRoomFromInput)
+        addRoomInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') addRoomFromInput()
+        })
+
+        function addRoomFromInput() {
+            const name = addRoomInput.value.trim()
+            if (!name || !conn) return
+            addRoomInput.value = ''
+            joinRoom(name)
+        }
+
+        // ── Utilities ─────────────────────────────────────
 
         function escapeHtml(str) {
             return str
@@ -123,8 +264,3 @@
                 .replace(/>/g, '&gt;')
                 .replace(/"/g, '&quot;')
         }
-
-        sendButton.addEventListener('click', sendChat)
-        messageInput.addEventListener('keydown', function(event) {
-            if (event.key === 'Enter') sendChat()
-        })

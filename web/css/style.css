@@ -113,16 +113,123 @@
             background: #a8f0bf;
         }
 
-        /* ── Chat ─────────────────────────────────────── */
+        /* ── Chat container ───────────────────────────── */
 
         #chatContainer {
             width: 100%;
             height: 100dvh;
-            max-width: 780px;
+            display: flex;
+            flex-direction: row;
+        }
+
+        /* ── Sidebar ──────────────────────────────────── */
+
+        #sidebar {
+            width: 200px;
+            flex-shrink: 0;
+            background: var(--surface);
+            border-right: 1px solid var(--border);
             display: flex;
             flex-direction: column;
-            border-left: 1px solid var(--border);
+            height: 100dvh;
+        }
+
+        #sidebarHeader {
+            padding: 0.85rem 1rem;
+            border-bottom: 1px solid var(--border);
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.75rem;
+            color: var(--subtle);
+            flex-shrink: 0;
+        }
+
+        #roomList {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0.5rem 0;
+        }
+
+        #roomList::-webkit-scrollbar { width: 4px; }
+        #roomList::-webkit-scrollbar-track { background: transparent; }
+        #roomList::-webkit-scrollbar-thumb { background: var(--border); }
+
+        .room-item {
+            display: flex;
+            align-items: center;
+            padding: 0.45rem 1rem;
+            cursor: pointer;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.82rem;
+            color: var(--subtle);
+            gap: 0.4rem;
+            transition: background 0.1s, color 0.1s;
+        }
+
+        .room-item:hover {
+            background: rgba(255,255,255,0.04);
+            color: var(--text);
+        }
+
+        .room-item.active {
+            color: var(--accent);
+            background: var(--accent-dim);
+        }
+
+        .room-item .room-hash { color: var(--muted); }
+        .room-item.active .room-hash { color: var(--accent); }
+
+        .room-item .leave-btn {
+            margin-left: auto;
+            background: transparent;
+            color: var(--muted);
+            font-size: 0.7rem;
+            padding: 0 0.2rem;
+            opacity: 0;
+            transition: opacity 0.1s, color 0.1s;
+        }
+
+        .room-item:hover .leave-btn { opacity: 1; }
+        .room-item .leave-btn:hover { color: var(--danger); }
+
+        #addRoomBar {
+            display: flex;
+            border-top: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        #addRoomInput {
+            flex: 1;
+            background: transparent;
+            border: none;
             border-right: 1px solid var(--border);
+            padding: 0.65rem 0.75rem;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.78rem;
+            color: var(--text);
+            outline: none;
+            width: 0; /* let flex-grow do the sizing */
+        }
+
+        #addRoomInput::placeholder { color: var(--muted); }
+        #addRoomInput:focus { border-color: var(--accent); }
+
+        #addRoomButton {
+            background: transparent;
+            color: var(--accent);
+            padding: 0 0.75rem;
+            font-size: 1rem;
+        }
+
+        #addRoomButton:hover { background: var(--accent-dim); }
+
+        /* ── Chat main pane ───────────────────────────── */
+
+        #chatMain {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            height: 100dvh;
+            min-width: 0; /* prevent flex blowout from long messages */
         }
 
         #chatHeader {
@@ -143,13 +250,6 @@
 
         #chatHeader span.hash {
             color: var(--muted);
-            font-family: 'IBM Plex Mono', monospace;
-        }
-
-        #chatHeader span.connected-as {
-            margin-left: auto;
-            font-size: 0.75rem;
-            color: var(--subtle);
             font-family: 'IBM Plex Mono', monospace;
         }
 

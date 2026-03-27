@@ -20,10 +20,6 @@
             <label for="password">Password</label>
             <input type="password" id="password" name="password" required autocomplete="current-password">
         </div>
-        <div class="field">
-            <label for="room">Room</label>
-            <input type="text" id="room" name="room" required autocomplete="off">
-        </div>
         <button type="submit">Connect →</button>
         <p style="font-size:0.78rem; color:var(--subtle); text-align:center; margin-top:0.5rem">
             No account? <a href="#" id="toggleRegister" style="color:var(--accent)">Register</a>
@@ -31,16 +27,30 @@
     </form>
 
     <div id="chatContainer" class="hidden">
-        <div id="chatHeader">
-            <span class="hash">#</span>
-            <span class="room-name" id="headerRoom"></span>
-            <span class="connected-as" id="headerUser"></span>
+
+        <aside id="sidebar">
+            <div id="sidebarHeader">
+                <span id="headerUser"></span>
+            </div>
+            <nav id="roomList"></nav>
+            <div id="addRoomBar">
+                <input type="text" id="addRoomInput" placeholder="join a room...">
+                <button id="addRoomButton">+</button>
+            </div>
+        </aside>
+
+        <div id="chatMain">
+            <div id="chatHeader">
+                <span class="hash">#</span>
+                <span class="room-name" id="headerRoom"></span>
+            </div>
+            <div id="messageList"></div>
+            <div id="inputBar">
+                <input type="text" id="messageInput" placeholder="Message...">
+                <button id="sendButton">Send</button>
+            </div>
         </div>
-        <div id="messageList"></div>
-        <div id="inputBar">
-            <input type="text" id="messageInput" placeholder="Message...">
-            <button id="sendButton">Send</button>
-        </div>
+
     </div>
 
     <script src="js/script.js"></script>

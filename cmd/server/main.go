@@ -17,20 +17,25 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// upgrader promotes HTTP connections to WebSocket. CheckOrigin is permissive
+// since sethchat is intended for trusted private networks, not the public web.
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
 }
 
+// db is the shared SQLite connection used by all HTTP and WebSocket handlers.
 var db *sql.DB
 
 // Hub manages all active WebSocket connections, organized by room.
+// clients maps room name → (connection → username).
 type Hub struct {
 	clients map[string]map[*websocket.Conn]string // room -> conn -> username
 	mu      sync.RWMutex
 }
 
+// addToRoom registers conn as username in room, creating the room map if needed.
 func (h *Hub) addToRoom(conn *websocket.Conn, user, room string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -40,6 +45,7 @@ func (h *Hub) addToRoom(conn *websocket.Conn, user, room string) {
 	h.clients[room][conn] = user
 }
 
+// removeFromRoom removes conn from a specific room only.
 func (h *Hub) removeFromRoom(conn *websocket.Conn, room string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -60,6 +66,8 @@ func (h *Hub) roomsForConn(conn *websocket.Conn) []string {
 	return rooms
 }
 
+// removeFromAll removes conn from every room. Called on disconnect to ensure
+// no stale connections remain in the hub.
 func (h *Hub) removeFromAll(conn *websocket.Conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -68,6 +76,8 @@ func (h *Hub) removeFromAll(conn *websocket.Conn) {
 	}
 }
 
+// broadcastToRoom sends message to every connection currently in room.
+// Write errors are logged but do not abort the broadcast to other clients.
 func (h *Hub) broadcastToRoom(message protocol.Message, sender *websocket.Conn, room string) {
 	mes, err := json.Marshal(message)
 	if err != nil {
@@ -86,6 +96,7 @@ func (h *Hub) broadcastToRoom(message protocol.Message, sender *websocket.Conn, 
 }
 
 // stamp sets the message timestamp to now if one hasn't been set already.
+// The server is the authority on time; client-supplied timestamps are ignored.
 func stamp(m protocol.Message) protocol.Message {
 	if m.Timestamp.IsZero() {
 		m.Timestamp = time.Now().UTC()
@@ -95,12 +106,37 @@ func stamp(m protocol.Message) protocol.Message {
 
 var hub = Hub{clients: make(map[string]map[*websocket.Conn]string)}
 
+// validateSessionParam reads ?session= from the request, validates it, and
+// returns the resolved userID. Writes an HTTP error and returns (0, false) on failure.
+func validateSessionParam(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	sid := r.URL.Query().Get("session")
+	if sid == "" {
+		http.Error(w, "session required", http.StatusUnauthorized)
+		return 0, false
+	}
+	userID, err := auth.ValidateSession(db, sid)
+	if err != nil {
+		if errors.Is(err, auth.ErrSessionExpired) {
+			http.Error(w, "session expired", http.StatusUnauthorized)
+		} else {
+			http.Error(w, "invalid session", http.StatusUnauthorized)
+		}
+		return 0, false
+	}
+	return userID, true
+}
+
+// lookupUsername resolves a userID (returned by auth.ValidateSession) to a
+// username string by querying the users table directly.
 func lookupUsername(userID int64) (string, error) {
 	var name string
 	err := db.QueryRow("SELECT name FROM users WHERE user_id = ?", userID).Scan(&name)
 	return name, err
 }
 
+// handleRegister creates a new user account.
+// Expects POST with JSON body: {"username": "...", "password": "..."}.
+// Returns 201 on success; the client must then call /login to get a session.
 func handleRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -121,6 +157,10 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 }
 
+// handleLogin authenticates a user and issues a session token.
+// Expects POST with JSON body: {"username": "...", "password": "..."}.
+// Returns JSON: {"session_id": "<uuid>"} on success.
+// The session_id must be passed as the ?session= query param when opening /ws.
 func handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -148,30 +188,94 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"session_id": sessionID})
 }
 
-func handleConnection(w http.ResponseWriter, r *http.Request) {
-	// Validate session before upgrading — http.Error won't work after Upgrade
-	sessionID := r.URL.Query().Get("session")
-	if sessionID == "" {
-		http.Error(w, "session required", http.StatusUnauthorized)
+// handleRooms manages the persistent room list for the authenticated user.
+//
+//	GET    → {"rooms": ["general", "random"]}  (ordered by join time)
+//	POST   body {"room":"name"} → 204          (idempotent via INSERT OR IGNORE)
+//	DELETE body {"room":"name"} → 204
+func handleRooms(w http.ResponseWriter, r *http.Request) {
+	userID, ok := validateSessionParam(w, r)
+	if !ok {
 		return
 	}
-	userID, err := auth.ValidateSession(db, sessionID)
-	if err != nil {
-		if errors.Is(err, auth.ErrSessionExpired) {
-			http.Error(w, "session expired", http.StatusUnauthorized)
-		} else {
-			http.Error(w, "invalid session", http.StatusUnauthorized)
+	switch r.Method {
+	case http.MethodGet:
+		rows, err := db.Query(
+			"SELECT room_name FROM user_rooms WHERE user_id = ? ORDER BY rowid ASC", userID)
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
 		}
+		defer rows.Close()
+		rooms := []string{} // initialised as slice (not nil) so JSON encodes as [] not null
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				http.Error(w, "scan error", http.StatusInternalServerError)
+				return
+			}
+			rooms = append(rooms, name)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string][]string{"rooms": rooms})
+
+	case http.MethodPost:
+		var req struct {
+			Room string `json:"room"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Room == "" {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if _, err := db.Exec(
+			"INSERT OR IGNORE INTO user_rooms (user_id, room_name) VALUES (?, ?)",
+			userID, req.Room); err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+
+	case http.MethodDelete:
+		var req struct {
+			Room string `json:"room"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Room == "" {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if _, err := db.Exec(
+			"DELETE FROM user_rooms WHERE user_id = ? AND room_name = ?",
+			userID, req.Room); err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleConnection upgrades an HTTP request to a WebSocket and manages the
+// full lifecycle of a chat connection.
+//
+// Query params:
+//   - session: required — UUID session token from /login
+//
+// Session validation happens before the WebSocket upgrade so that rejected
+// connections receive a proper HTTP 401 rather than a WebSocket close frame.
+// No room is auto-joined on connect; the client sends joinRoom messages after
+// fetching its saved rooms via GET /rooms.
+func handleConnection(w http.ResponseWriter, r *http.Request) {
+	// Validate session before upgrading — http.Error won't work after Upgrade.
+	userID, ok := validateSessionParam(w, r)
+	if !ok {
 		return
 	}
 	user, err := lookupUsername(userID)
 	if err != nil {
 		http.Error(w, "user not found", http.StatusUnauthorized)
 		return
-	}
-	room := r.URL.Query().Get("room")
-	if room == "" {
-		room = "general"
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -180,20 +284,14 @@ func handleConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	defer hub.removeFromAll(conn) // clean up all room memberships on disconnect
 
-	hub.addToRoom(conn, user, room)
-	defer hub.removeFromAll(conn)
-
-	welcomeMessage := stamp(protocol.Message{
-		Type:    protocol.TypeSystem,
-		Content: fmt.Sprintf("*** %s connected to %s ***", user, room),
-	})
-	hub.broadcastToRoom(welcomeMessage, conn, room)
-	log.Printf("client connected: %s in %s", user, room)
+	log.Printf("client connected: %s", user)
 
 	for {
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
+			// Notify all rooms the user was in before removing them from the hub.
 			rooms := hub.roomsForConn(conn)
 			disconnectMessage := stamp(protocol.Message{
 				Type:    protocol.TypeSystem,
@@ -215,6 +313,9 @@ func handleConnection(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleMessage parses a raw WebSocket frame and acts on its message type.
+// user is the server-verified username of the sender; it overrides any sender
+// field supplied by the client to prevent identity spoofing.
 func handleMessage(raw []byte, conn *websocket.Conn, user string) {
 	var message protocol.Message
 	if err := json.Unmarshal(raw, &message); err != nil {
@@ -227,9 +328,11 @@ func handleMessage(raw []byte, conn *websocket.Conn, user string) {
 
 	switch message.Type {
 	case protocol.TypeSystem:
+		// Clients cannot emit system messages; ignore to prevent spoofing.
 		log.Println("received system message (ignored)")
 
 	case protocol.TypeChat:
+		// Override sender with the authenticated username.
 		message.Sender = user
 		hub.broadcastToRoom(message, conn, message.Room)
 
@@ -264,6 +367,7 @@ func main() {
 
 	http.HandleFunc("/register", handleRegister)
 	http.HandleFunc("/login", handleLogin)
+	http.HandleFunc("/rooms", handleRooms)
 	http.HandleFunc("/ws", handleConnection)
 	fmt.Println("server listening on :8080")
 	http.Handle("/", http.FileServer(http.Dir("./web")))
