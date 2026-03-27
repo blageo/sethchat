@@ -58,11 +58,13 @@ go run ./cmd/server/main.go
 
 The server listens on `:8080` and serves the web client at `http://localhost:8080`. A `sethchat.db` SQLite database is created automatically in the working directory on first run.
 
-**First-run squad setup:** The first user to register becomes the squad owner. Use `-squad-name` to set the squad name on initial startup (ignored on subsequent runs):
+**First-run squad setup:** The first user to register becomes the squad owner. The squad name defaults to `My Squad` and can be changed at any time by the owner via the in-app settings panel. To set a different name on first startup:
 
 ```bash
 go run ./cmd/server/main.go -squad-name "My Squad"
 ```
+
+> Note: `-squad-name` is only applied on the first run. Once the database exists, the name is managed through the app.
 
 ### Running with TLS
 
