@@ -346,12 +346,60 @@
 
         /* ── Input bar ────────────────────────────────── */
 
+        #pendingMedia {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.4rem 1.25rem;
+            background: var(--accent-dim);
+            border-top: 1px solid var(--border);
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.75rem;
+            color: var(--accent);
+            flex-shrink: 0;
+        }
+
+        #pendingMediaName {
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        #clearMediaButton {
+            background: transparent;
+            color: var(--accent);
+            font-size: 0.75rem;
+            padding: 0 0.25rem;
+        }
+
+        #clearMediaButton:hover {
+            color: var(--danger);
+        }
+
         #inputBar {
             display: flex;
             gap: 0;
             border-top: 1px solid var(--border);
             background: var(--surface);
             flex-shrink: 0;
+        }
+
+        #attachButton {
+            background: transparent;
+            color: var(--muted);
+            padding: 0 1rem;
+            font-size: 1rem;
+            border-right: 1px solid var(--border);
+            transition: color 0.15s;
+        }
+
+        #attachButton:hover {
+            color: var(--accent);
+        }
+
+        #attachButton.has-media {
+            color: var(--accent);
         }
 
         #messageInput {
@@ -379,6 +427,31 @@
 
         #sendButton:hover {
             background: var(--accent-dim);
+        }
+
+        /* ── Media in messages ────────────────────────── */
+
+        .message .media-content {
+            margin-top: 0.35rem;
+            max-width: 100%;
+        }
+
+        .message .media-content img {
+            max-width: 320px;
+            max-height: 240px;
+            width: 100%;
+            object-fit: contain;
+            display: block;
+            border-radius: 2px;
+            cursor: pointer;
+        }
+
+        .message .media-content video {
+            max-width: 320px;
+            max-height: 240px;
+            width: 100%;
+            display: block;
+            border-radius: 2px;
         }
 
         /* ── Utility ──────────────────────────────────── */

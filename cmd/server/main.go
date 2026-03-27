@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -107,6 +108,23 @@ func stamp(m protocol.Message) protocol.Message {
 
 var hub = Hub{clients: make(map[string]map[*websocket.Conn]string)}
 
+// mediaItem holds an uploaded file in memory. Media is intentionally
+// non-persistent: the store is cleared when the server restarts.
+type mediaItem struct {
+	data        []byte
+	contentType string
+}
+
+const maxUploadSize = 50 << 20 // 50 MB
+
+// allowedMediaTypes lists MIME prefixes accepted for upload.
+var allowedMediaTypes = []string{"image/", "video/"}
+
+var (
+	mediaStore   = map[string]mediaItem{}
+	mediaStoreMu sync.RWMutex
+)
+
 // validateSessionParam reads ?session= from the request, validates it, and
 // returns the resolved userID. Writes an HTTP error and returns (0, false) on failure.
 func validateSessionParam(w http.ResponseWriter, r *http.Request) (int64, bool) {
@@ -133,6 +151,81 @@ func lookupUsername(userID int64) (string, error) {
 	var name string
 	err := db.QueryRow("SELECT name FROM users WHERE user_id = ?", userID).Scan(&name)
 	return name, err
+}
+
+// handleUpload accepts a multipart file upload from an authenticated user and
+// stores it in the in-memory media store. Returns JSON: {"url":"/media/<id>","type":"image/jpeg"}.
+// Accepted types: image/* and video/*. Max size: 50 MB.
+func handleUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, ok := validateSessionParam(w, r); !ok {
+		return
+	}
+	if err := r.ParseMultipartForm(maxUploadSize); err != nil {
+		http.Error(w, "file too large or malformed", http.StatusBadRequest)
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "missing file field", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	// Detect content type from the first 512 bytes, then re-read the rest.
+	buf := make([]byte, 512)
+	n, _ := file.Read(buf)
+	contentType := http.DetectContentType(buf[:n])
+
+	allowed := false
+	for _, prefix := range allowedMediaTypes {
+		if strings.HasPrefix(contentType, prefix) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		http.Error(w, "unsupported media type: "+contentType, http.StatusUnsupportedMediaType)
+		return
+	}
+
+	// Read the remainder and prepend the already-read bytes.
+	rest := make([]byte, header.Size-int64(n))
+	file.Read(rest)
+	data := append(buf[:n], rest...)
+
+	// Use the UUID package already in go.mod via the auth package.
+	id := fmt.Sprintf("%d", time.Now().UnixNano())
+	mediaStoreMu.Lock()
+	mediaStore[id] = mediaItem{data: data, contentType: contentType}
+	mediaStoreMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"url":  "/media/" + id,
+		"type": contentType,
+	})
+}
+
+// handleMedia serves a previously uploaded media item from the in-memory store.
+func handleMedia(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/media/")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	mediaStoreMu.RLock()
+	item, ok := mediaStore[id]
+	mediaStoreMu.RUnlock()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", item.contentType)
+	w.Write(item.data)
 }
 
 // handleRegister creates a new user account.
@@ -374,6 +467,8 @@ func main() {
 	http.HandleFunc("/register", handleRegister)
 	http.HandleFunc("/login", handleLogin)
 	http.HandleFunc("/rooms", handleRooms)
+	http.HandleFunc("/upload", handleUpload)
+	http.HandleFunc("/media/", handleMedia)
 	http.HandleFunc("/ws", handleConnection)
 	http.Handle("/", http.FileServer(http.Dir("./web")))
 

@@ -1,15 +1,20 @@
-        const loginForm      = document.getElementById('loginForm')
-        const chatContainer  = document.getElementById('chatContainer')
-        const messageList    = document.getElementById('messageList')
-        const messageInput   = document.getElementById('messageInput')
-        const sendButton     = document.getElementById('sendButton')
-        const headerRoom     = document.getElementById('headerRoom')
-        const headerUser     = document.getElementById('headerUser')
-        const passwordInput  = document.getElementById('password')
-        const loginError     = document.getElementById('loginError')
-        const toggleRegister = document.getElementById('toggleRegister')
-        const addRoomInput   = document.getElementById('addRoomInput')
-        const addRoomButton  = document.getElementById('addRoomButton')
+        const loginForm        = document.getElementById('loginForm')
+        const chatContainer    = document.getElementById('chatContainer')
+        const messageList      = document.getElementById('messageList')
+        const messageInput     = document.getElementById('messageInput')
+        const sendButton       = document.getElementById('sendButton')
+        const headerRoom       = document.getElementById('headerRoom')
+        const headerUser       = document.getElementById('headerUser')
+        const passwordInput    = document.getElementById('password')
+        const loginError       = document.getElementById('loginError')
+        const toggleRegister   = document.getElementById('toggleRegister')
+        const addRoomInput     = document.getElementById('addRoomInput')
+        const addRoomButton    = document.getElementById('addRoomButton')
+        const fileInput        = document.getElementById('fileInput')
+        const attachButton     = document.getElementById('attachButton')
+        const pendingMediaEl   = document.getElementById('pendingMedia')
+        const pendingMediaName = document.getElementById('pendingMediaName')
+        const clearMediaButton = document.getElementById('clearMediaButton')
 
         let conn           = null
         let user           = null
@@ -18,6 +23,7 @@
         const messages     = {}           // { [roomName]: Message[] }
         const joinedRooms  = new Set()    // insertion-ordered set of joined rooms
         let isRegisterMode = false
+        let pendingMedia   = null         // { url, type, name } or null
 
         // ── Login / Register ──────────────────────────────
 
@@ -207,12 +213,34 @@
             if (message.type === 'chat') {
                 const isOwn = message.sender === user
                 el.classList.add('message', isOwn ? 'own' : 'theirs')
+
+                let mediaHTML = ''
+                if (message.mediaURL) {
+                    if (message.mediaType && message.mediaType.startsWith('video/')) {
+                        mediaHTML = `<div class="media-content">
+                            <video src="${escapeHtml(message.mediaURL)}" controls></video>
+                        </div>`
+                    } else {
+                        // images and GIFs
+                        mediaHTML = `<div class="media-content">
+                            <img src="${escapeHtml(message.mediaURL)}"
+                                 alt="attached media"
+                                 onclick="window.open(this.src)">
+                        </div>`
+                    }
+                }
+
+                const bodyHTML = message.content
+                    ? `<div class="body">${escapeHtml(message.content)}</div>`
+                    : ''
+
                 el.innerHTML = `
                     <div class="meta">
                         <span class="sender">${escapeHtml(message.sender)}</span>
                         <span class="ts">${ts}</span>
                     </div>
-                    <div class="body">${escapeHtml(message.content)}</div>
+                    ${bodyHTML}
+                    ${mediaHTML}
                 `
             } else if (message.type === 'system') {
                 el.classList.add('message', 'system')
@@ -223,17 +251,83 @@
             el.scrollIntoView({ behavior: 'smooth', block: 'end' })
         }
 
+        // ── Media attachment ──────────────────────────────
+
+        attachButton.addEventListener('click', () => fileInput.click())
+
+        fileInput.addEventListener('change', async function() {
+            const file = fileInput.files[0]
+            if (!file) return
+            fileInput.value = '' // reset so same file can be re-selected
+            await uploadFile(file)
+        })
+
+        // Paste an image directly from the clipboard (e.g. a screenshot).
+        messageInput.addEventListener('paste', async function(e) {
+            const items = e.clipboardData?.items
+            if (!items) return
+            for (const item of items) {
+                if (item.type.startsWith('image/')) {
+                    e.preventDefault() // don't paste raw data-url text
+                    const file = item.getAsFile()
+                    if (file) await uploadFile(file)
+                    break
+                }
+            }
+        })
+
+        async function uploadFile(file) {
+            const formData = new FormData()
+            formData.append('file', file)
+
+            const res = await fetch(`/upload?session=${sessionId}`, {
+                method: 'POST',
+                body: formData,
+            })
+            if (!res.ok) {
+                alert('Upload failed: ' + (await res.text()).trim())
+                return
+            }
+            const data = await res.json()
+            // Use the original filename if available, otherwise label as pasted image.
+            const displayName = file.name && file.name !== 'image.png'
+                ? file.name
+                : 'pasted image'
+            pendingMedia = { url: data.url, type: data.type, name: displayName }
+            pendingMediaName.textContent = '📎 ' + displayName
+            pendingMediaEl.classList.remove('hidden')
+            attachButton.classList.add('has-media')
+            messageInput.focus()
+        }
+
+        clearMediaButton.addEventListener('click', clearPendingMedia)
+
+        function clearPendingMedia() {
+            pendingMedia = null
+            pendingMediaEl.classList.add('hidden')
+            pendingMediaName.textContent = ''
+            attachButton.classList.remove('has-media')
+        }
+
         // ── Sending messages ──────────────────────────────
 
         function sendChat() {
             const content = messageInput.value.trim()
-            if (!content || !conn || !activeRoom) return
-            conn.send(JSON.stringify({
+            if (!content && !pendingMedia) return
+            if (!conn || !activeRoom) return
+
+            const msg = {
                 type:    'chat',
                 sender:  user,
                 room:    activeRoom,
                 content: content,
-            }))
+            }
+            if (pendingMedia) {
+                msg.mediaURL  = pendingMedia.url
+                msg.mediaType = pendingMedia.type
+                clearPendingMedia()
+            }
+            conn.send(JSON.stringify(msg))
             messageInput.value = ''
         }
 

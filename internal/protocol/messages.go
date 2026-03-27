@@ -18,5 +18,7 @@ type Message struct {
 	Room      string      `json:"room"`
 	Sender    string      `json:"sender,omitempty"`
 	Content   string      `json:"content"`
+	MediaURL  string      `json:"mediaURL,omitempty"`  // optional: path to uploaded media
+	MediaType string      `json:"mediaType,omitempty"` // optional: MIME type of media
 	Timestamp time.Time   `json:"timestamp"`
 }

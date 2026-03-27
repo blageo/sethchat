@@ -45,7 +45,13 @@
                 <span class="room-name" id="headerRoom"></span>
             </div>
             <div id="messageList"></div>
+            <div id="pendingMedia" class="hidden">
+                <span id="pendingMediaName"></span>
+                <button id="clearMediaButton">✕</button>
+            </div>
             <div id="inputBar">
+                <input type="file" id="fileInput" accept="image/*,video/*" style="display:none">
+                <button id="attachButton" type="button" title="Attach media">&#128206;</button>
                 <input type="text" id="messageInput" placeholder="Message...">
                 <button id="sendButton">Send</button>
             </div>
