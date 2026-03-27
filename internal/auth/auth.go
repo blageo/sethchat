@@ -11,13 +11,16 @@ import (
 
 var ErrSessionExpired = errors.New("session expired")
 
-func Register(db *sql.DB, username, password string) error {
+func Register(db *sql.DB, username, password string) (int64, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	_, err = db.Exec("INSERT INTO users (name, password_hash) VALUES (?, ?)", username, hash)
-	return err
+	result, err := db.Exec("INSERT INTO users (name, password_hash) VALUES (?, ?)", username, hash)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
 }
 
 func Login(db *sql.DB, username, password string) (int64, error) {

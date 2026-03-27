@@ -24,6 +24,7 @@
         const joinedRooms  = new Set()    // insertion-ordered set of joined rooms
         let isRegisterMode = false
         let pendingMedia   = null         // { url, type, name } or null
+        let squadInfo      = null         // { name, description, your_role }
 
         // ── Login / Register ──────────────────────────────
 
@@ -74,9 +75,13 @@
 
             conn.onopen = async function() {
                 console.log('Connection established')
-                headerUser.textContent = user
                 loginForm.classList.add('hidden')
                 chatContainer.classList.remove('hidden')
+
+                // Fetch squad info and render the sidebar header.
+                const squadRes = await fetch(`/squad?session=${sessionId}`)
+                squadInfo = await squadRes.json()
+                renderSquadHeader()
 
                 // Restore saved rooms from the server, then join each one.
                 const roomsRes = await fetch(`/rooms?session=${sessionId}`)
@@ -348,6 +353,122 @@
             if (!name || !conn) return
             addRoomInput.value = ''
             joinRoom(name)
+        }
+
+        // ── Squad header ──────────────────────────────────
+
+        function renderSquadHeader() {
+            document.getElementById('squadName').textContent = squadInfo.name
+
+            const roleLabels = { owner: '♛ owner', admin: '★ admin', member: '' }
+            document.getElementById('headerUser').textContent = user
+            const badge = document.getElementById('userRoleBadge')
+            badge.textContent = roleLabels[squadInfo.your_role] || ''
+            badge.className = 'role-' + squadInfo.your_role
+
+            // Settings button only visible to owner
+            const settingsBtn = document.getElementById('settingsButton')
+            if (squadInfo.your_role === 'owner') {
+                settingsBtn.classList.remove('hidden')
+            } else {
+                settingsBtn.classList.add('hidden')
+            }
+        }
+
+        // ── Modal helpers ─────────────────────────────────
+
+        const modalOverlay = document.getElementById('modalOverlay')
+        const modalTitle   = document.getElementById('modalTitle')
+        const modalBody    = document.getElementById('modalBody')
+        const modalClose   = document.getElementById('modalClose')
+
+        function openModal(title, bodyHTML) {
+            modalTitle.textContent = title
+            modalBody.innerHTML = bodyHTML
+            modalOverlay.classList.remove('hidden')
+        }
+
+        function closeModal() {
+            modalOverlay.classList.add('hidden')
+            modalBody.innerHTML = ''
+        }
+
+        modalClose.addEventListener('click', closeModal)
+        modalOverlay.addEventListener('click', e => { if (e.target === modalOverlay) closeModal() })
+
+        // ── Settings panel (owner only) ───────────────────
+
+        document.getElementById('settingsButton').addEventListener('click', openSettingsPanel)
+
+        function openSettingsPanel() {
+            openModal('Squad Settings', `
+                <div class="field">
+                    <label>Squad Name</label>
+                    <input type="text" id="settingsName" value="${escapeHtml(squadInfo.name)}">
+                </div>
+                <div class="field">
+                    <label>Description</label>
+                    <input type="text" id="settingsDesc" value="${escapeHtml(squadInfo.description)}">
+                </div>
+                <button id="saveSettingsBtn" style="align-self:flex-start">Save</button>
+                <p id="settingsMsg" style="font-size:0.78rem;color:var(--accent)"></p>
+            `)
+            document.getElementById('saveSettingsBtn').addEventListener('click', async () => {
+                const name = document.getElementById('settingsName').value.trim()
+                const description = document.getElementById('settingsDesc').value.trim()
+                if (!name) return
+                const res = await fetch(`/squad?session=${sessionId}`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, description }),
+                })
+                if (res.ok) {
+                    squadInfo.name = name
+                    squadInfo.description = description
+                    renderSquadHeader()
+                    document.getElementById('settingsMsg').textContent = 'Saved.'
+                }
+            })
+        }
+
+        // ── Members panel ─────────────────────────────────
+
+        document.getElementById('membersButton').addEventListener('click', openMembersPanel)
+
+        async function openMembersPanel() {
+            const res = await fetch(`/squad/members?session=${sessionId}`)
+            const data = await res.json()
+            const isOwner = squadInfo.your_role === 'owner'
+            const roleLabels = { owner: '♛ owner', admin: '★ admin', member: 'member' }
+
+            const rows = data.members.map(m => {
+                const roleDisplay = isOwner && m.role !== 'owner'
+                    ? `<select class="role-select" data-uid="${m.id}">
+                        <option value="admin"  ${m.role === 'admin'  ? 'selected' : ''}>admin</option>
+                        <option value="member" ${m.role === 'member' ? 'selected' : ''}>member</option>
+                       </select>`
+                    : `<span class="member-role role-${m.role}">${roleLabels[m.role]}</span>`
+
+                return `<div class="member-item">
+                    <span class="member-name">${escapeHtml(m.name)}</span>
+                    ${roleDisplay}
+                </div>`
+            }).join('')
+
+            openModal('Members', rows)
+
+            // Wire up role selects (owner only)
+            if (isOwner) {
+                modalBody.querySelectorAll('.role-select').forEach(sel => {
+                    sel.addEventListener('change', async function() {
+                        await fetch(`/squad/members?session=${sessionId}`, {
+                            method: 'PATCH',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ user_id: parseInt(this.dataset.uid), role: this.value }),
+                        })
+                    })
+                })
+            }
         }
 
         // ── Utilities ─────────────────────────────────────

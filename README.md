@@ -10,6 +10,8 @@ A self-hosted group chat application built with Go and WebSockets. Designed to b
 
 - Real-time messaging over WebSockets
 - User registration and login with bcrypt password hashing and session tokens
+- Squad structure — one server instance is one squad; users have owner, admin, or member roles
+- Owner can rename the squad and manage member roles via the in-app UI
 - Persistent room membership — your joined rooms are remembered across sessions
 - Room sidebar with instant switching between rooms
 - Media sharing — attach images, GIFs, and videos; paste screenshots directly from clipboard
@@ -55,6 +57,12 @@ go run ./cmd/server/main.go
 ```
 
 The server listens on `:8080` and serves the web client at `http://localhost:8080`. A `sethchat.db` SQLite database is created automatically in the working directory on first run.
+
+**First-run squad setup:** The first user to register becomes the squad owner. Use `-squad-name` to set the squad name on initial startup (ignored on subsequent runs):
+
+```bash
+go run ./cmd/server/main.go -squad-name "My Squad"
+```
 
 ### Running with TLS
 
@@ -104,6 +112,10 @@ go run ./cmd/client/main.go --user yourname --room general
 | `GET` | `/rooms` | `?session=` | List the user's saved rooms |
 | `POST` | `/rooms` | `?session=` | Add a room. Body: `{"room":"…"}` |
 | `DELETE` | `/rooms` | `?session=` | Remove a room. Body: `{"room":"…"}` |
+| `GET` | `/squad` | `?session=` | Get squad info and your role. Returns `{"name":"…","description":"…","your_role":"…"}` |
+| `PATCH` | `/squad` | `?session=` | Update squad name/description (owner only). Body: `{"name":"…","description":"…"}` |
+| `GET` | `/squad/members` | `?session=` | List all members ordered by role |
+| `PATCH` | `/squad/members` | `?session=` | Change a member's role (owner only). Body: `{"user_id":2,"role":"admin"}` |
 | `POST` | `/upload` | `?session=` | Upload media (multipart, max 50 MB). Returns `{"url":"…","type":"…"}` |
 | `GET` | `/media/<id>` | — | Serve an uploaded media file |
 | `GET` | `/ws` | `?session=` | Upgrade to WebSocket |
@@ -137,11 +149,13 @@ Messages are JSON-encoded WebSocket frames:
 ## Roadmap
 
 - [x] Authentication (registration, login, sessions)
+- [x] Server structure (squads) i.e. collections of rooms. One instance of sethchat = 1 squad. 
 - [ ] Message persistence (database)
 - [x] HTTPS / WSS support
 - [x] Media sharing (images, GIFs)
 - [ ] Docker packaging for easy self-hosting
 - [ ] Mobile-friendly UI polish
+- [ ] E2EE
 
 ## Built With
 

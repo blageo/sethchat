@@ -228,9 +228,20 @@ func handleMedia(w http.ResponseWriter, r *http.Request) {
 	w.Write(item.data)
 }
 
+// getUserRole returns the squad role for userID: "owner", "admin", or "member".
+// Returns "member" if no role row exists (defensive default).
+func getUserRole(userID int64) string {
+	var role string
+	if err := db.QueryRow("SELECT role FROM user_squad_roles WHERE user_id = ?", userID).Scan(&role); err != nil {
+		return "member"
+	}
+	return role
+}
+
 // handleRegister creates a new user account.
 // Expects POST with JSON body: {"username": "...", "password": "..."}.
 // Returns 201 on success; the client must then call /login to get a session.
+// The first user to register is automatically assigned the "owner" role.
 func handleRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -244,11 +255,137 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if err := auth.Register(db, req.Username, req.Password); err != nil {
+	userID, err := auth.Register(db, req.Username, req.Password)
+	if err != nil {
 		http.Error(w, "registration failed: "+err.Error(), http.StatusConflict)
 		return
 	}
+
+	// Assign role: owner if no owner exists yet, otherwise member.
+	role := "member"
+	var ownerCount int
+	db.QueryRow("SELECT COUNT(*) FROM user_squad_roles WHERE role = 'owner'").Scan(&ownerCount)
+	if ownerCount == 0 {
+		role = "owner"
+	}
+	db.Exec("INSERT INTO user_squad_roles (user_id, role) VALUES (?, ?)", userID, role)
+
 	w.WriteHeader(http.StatusCreated)
+}
+
+// handleSquad returns squad info (GET) or updates it (PATCH, owner only).
+//
+//	GET  → {"name":"…","description":"…","your_role":"owner"}
+//	PATCH body {"name":"…","description":"…"} → 204
+func handleSquad(w http.ResponseWriter, r *http.Request) {
+	userID, ok := validateSessionParam(w, r)
+	if !ok {
+		return
+	}
+	role := getUserRole(userID)
+
+	switch r.Method {
+	case http.MethodGet:
+		var name, description string
+		db.QueryRow("SELECT name, description FROM squad WHERE id = 1").Scan(&name, &description)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"name":        name,
+			"description": description,
+			"your_role":   role,
+		})
+
+	case http.MethodPatch:
+		if role != "owner" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		var req struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		db.Exec("UPDATE squad SET name = ?, description = ? WHERE id = 1", req.Name, req.Description)
+		w.WriteHeader(http.StatusNoContent)
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleSquadMembers lists all members (GET) or changes a member's role (PATCH, owner only).
+//
+//	GET  → {"members":[{"id":1,"name":"alice","role":"owner"},…]}
+//	PATCH body {"user_id":2,"role":"admin"} → 204
+func handleSquadMembers(w http.ResponseWriter, r *http.Request) {
+	userID, ok := validateSessionParam(w, r)
+	if !ok {
+		return
+	}
+	role := getUserRole(userID)
+
+	switch r.Method {
+	case http.MethodGet:
+		rows, err := db.Query(`
+			SELECT u.user_id, u.name, COALESCE(r.role, 'member')
+			FROM users u
+			LEFT JOIN user_squad_roles r ON u.user_id = r.user_id
+			ORDER BY CASE COALESCE(r.role,'member')
+				WHEN 'owner'  THEN 0
+				WHEN 'admin'  THEN 1
+				ELSE               2
+			END, u.name ASC`)
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+		type member struct {
+			ID   int64  `json:"id"`
+			Name string `json:"name"`
+			Role string `json:"role"`
+		}
+		members := []member{}
+		for rows.Next() {
+			var m member
+			rows.Scan(&m.ID, &m.Name, &m.Role)
+			members = append(members, m)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"members": members})
+
+	case http.MethodPatch:
+		if role != "owner" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		var req struct {
+			UserID int64  `json:"user_id"`
+			Role   string `json:"role"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		// Prevent owner from demoting themselves.
+		if req.UserID == userID {
+			http.Error(w, "cannot change your own role", http.StatusBadRequest)
+			return
+		}
+		// Only 'admin' and 'member' are valid targets (can't promote to owner).
+		if req.Role != "admin" && req.Role != "member" {
+			http.Error(w, "invalid role", http.StatusBadRequest)
+			return
+		}
+		db.Exec("UPDATE user_squad_roles SET role = ? WHERE user_id = ?", req.Role, req.UserID)
+		w.WriteHeader(http.StatusNoContent)
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 // handleLogin authenticates a user and issues a session token.
@@ -455,6 +592,7 @@ func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	certFile := flag.String("cert", "", "TLS certificate file (PEM)")
 	keyFile := flag.String("key", "", "TLS key file (PEM)")
+	squadName := flag.String("squad-name", "My Squad", "Squad name shown to all members (used only on first run)")
 	flag.Parse()
 
 	var err error
@@ -464,9 +602,16 @@ func main() {
 	}
 	defer db.Close()
 
+	// Seed the squad row on first run; INSERT OR IGNORE is a no-op thereafter.
+	if _, err = db.Exec(`INSERT OR IGNORE INTO squad (id, name) VALUES (1, ?)`, *squadName); err != nil {
+		log.Fatal("failed to init squad:", err)
+	}
+
 	http.HandleFunc("/register", handleRegister)
 	http.HandleFunc("/login", handleLogin)
 	http.HandleFunc("/rooms", handleRooms)
+	http.HandleFunc("/squad", handleSquad)
+	http.HandleFunc("/squad/members", handleSquadMembers)
 	http.HandleFunc("/upload", handleUpload)
 	http.HandleFunc("/media/", handleMedia)
 	http.HandleFunc("/ws", handleConnection)

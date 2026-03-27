@@ -30,7 +30,15 @@
 
         <aside id="sidebar">
             <div id="sidebarHeader">
-                <span id="headerUser"></span>
+                <div id="squadName"></div>
+                <div id="sidebarUser">
+                    <span id="headerUser"></span>
+                    <span id="userRoleBadge"></span>
+                </div>
+                <div id="sidebarActions">
+                    <button id="membersButton" title="Members">&#128101;</button>
+                    <button id="settingsButton" title="Squad Settings" class="hidden">&#9881;</button>
+                </div>
             </div>
             <nav id="roomList"></nav>
             <div id="addRoomBar">
@@ -57,6 +65,16 @@
             </div>
         </div>
 
+    </div>
+
+    <div id="modalOverlay" class="hidden">
+        <div id="modal">
+            <div id="modalHeader">
+                <span id="modalTitle"></span>
+                <button id="modalClose">✕</button>
+            </div>
+            <div id="modalBody"></div>
+        </div>
     </div>
 
     <script src="js/script.js"></script>

@@ -46,6 +46,16 @@ func Open(path string) (*sql.DB, error) {
 		PRIMARY KEY (user_id, room_name),
 		FOREIGN KEY (user_id) REFERENCES users(user_id)
 	);
+	CREATE TABLE IF NOT EXISTS squad (
+		id          INTEGER PRIMARY KEY CHECK (id = 1),
+		name        TEXT NOT NULL DEFAULT 'My Squad',
+		description TEXT NOT NULL DEFAULT ''
+	);
+	CREATE TABLE IF NOT EXISTS user_squad_roles (
+		user_id INTEGER PRIMARY KEY,
+		role    TEXT NOT NULL DEFAULT 'member',
+		FOREIGN KEY (user_id) REFERENCES users(user_id)
+	);
 	`)
 
 	if err != nil {
