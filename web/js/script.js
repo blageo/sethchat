@@ -63,7 +63,8 @@
             sessionId = data.session_id
             user = username
 
-            conn = new WebSocket(`ws://${window.location.host}/ws?session=${sessionId}`)
+            const wsScheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+            conn = new WebSocket(`${wsScheme}//${window.location.host}/ws?session=${sessionId}`)
 
             conn.onopen = async function() {
                 console.log('Connection established')

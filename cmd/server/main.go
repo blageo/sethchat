@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -358,6 +359,11 @@ func handleMessage(raw []byte, conn *websocket.Conn, user string) {
 }
 
 func main() {
+	addr := flag.String("addr", ":8080", "listen address")
+	certFile := flag.String("cert", "", "TLS certificate file (PEM)")
+	keyFile := flag.String("key", "", "TLS key file (PEM)")
+	flag.Parse()
+
 	var err error
 	db, err = database.Open("sethchat.db")
 	if err != nil {
@@ -369,7 +375,13 @@ func main() {
 	http.HandleFunc("/login", handleLogin)
 	http.HandleFunc("/rooms", handleRooms)
 	http.HandleFunc("/ws", handleConnection)
-	fmt.Println("server listening on :8080")
 	http.Handle("/", http.FileServer(http.Dir("./web")))
-	log.Fatal(http.ListenAndServe(":8080", nil))
+
+	if *certFile != "" && *keyFile != "" {
+		fmt.Printf("server listening on %s (TLS)\n", *addr)
+		log.Fatal(http.ListenAndServeTLS(*addr, *certFile, *keyFile, nil))
+	} else {
+		fmt.Printf("server listening on %s (plaintext)\n", *addr)
+		log.Fatal(http.ListenAndServe(*addr, nil))
+	}
 }
