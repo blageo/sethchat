@@ -27,9 +27,24 @@ go.work.sum
 # env file
 .env
 
+# SQLite database
+*.db
+
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# TLS certificates
+*.pem
+*.crt
+*.key
+
+# Built binaries
+server
+client
 
 # Claude Code
 CLAUDE.md
