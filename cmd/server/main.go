@@ -1,13 +1,17 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"sync"
 	"time"
 
+	"sethchat/internal/auth"
+	"sethchat/internal/database"
 	"sethchat/internal/protocol"
 
 	"github.com/gorilla/websocket"
@@ -18,6 +22,8 @@ var upgrader = websocket.Upgrader{
 		return true
 	},
 }
+
+var db *sql.DB
 
 // Hub manages all active WebSocket connections, organized by room.
 type Hub struct {
@@ -89,23 +95,91 @@ func stamp(m protocol.Message) protocol.Message {
 
 var hub = Hub{clients: make(map[string]map[*websocket.Conn]string)}
 
-func handleConnection(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println("upgrade error:", err)
+func lookupUsername(userID int64) (string, error) {
+	var name string
+	err := db.QueryRow("SELECT name FROM users WHERE user_id = ?", userID).Scan(&name)
+	return name, err
+}
+
+func handleRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	defer conn.Close()
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := auth.Register(db, req.Username, req.Password); err != nil {
+		http.Error(w, "registration failed: "+err.Error(), http.StatusConflict)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
 
-	user := r.URL.Query().Get("user")
-	if user == "" {
-		log.Println("rejected connection: user param required")
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	userID, err := auth.Login(db, req.Username, req.Password)
+	if err != nil {
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		return
+	}
+	sessionID, err := auth.CreateSession(db, userID)
+	if err != nil {
+		http.Error(w, "could not create session", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"session_id": sessionID})
+}
+
+func handleConnection(w http.ResponseWriter, r *http.Request) {
+	// Validate session before upgrading — http.Error won't work after Upgrade
+	sessionID := r.URL.Query().Get("session")
+	if sessionID == "" {
+		http.Error(w, "session required", http.StatusUnauthorized)
+		return
+	}
+	userID, err := auth.ValidateSession(db, sessionID)
+	if err != nil {
+		if errors.Is(err, auth.ErrSessionExpired) {
+			http.Error(w, "session expired", http.StatusUnauthorized)
+		} else {
+			http.Error(w, "invalid session", http.StatusUnauthorized)
+		}
+		return
+	}
+	user, err := lookupUsername(userID)
+	if err != nil {
+		http.Error(w, "user not found", http.StatusUnauthorized)
 		return
 	}
 	room := r.URL.Query().Get("room")
 	if room == "" {
 		room = "general"
 	}
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("upgrade error:", err)
+		return
+	}
+	defer conn.Close()
 
 	hub.addToRoom(conn, user, room)
 	defer hub.removeFromAll(conn)
@@ -137,11 +211,11 @@ func handleConnection(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		handleMessage(raw, conn)
+		handleMessage(raw, conn, user)
 	}
 }
 
-func handleMessage(raw []byte, conn *websocket.Conn) {
+func handleMessage(raw []byte, conn *websocket.Conn, user string) {
 	var message protocol.Message
 	if err := json.Unmarshal(raw, &message); err != nil {
 		log.Printf("unmarshal error: %v | raw: %q", err, string(raw))
@@ -156,14 +230,15 @@ func handleMessage(raw []byte, conn *websocket.Conn) {
 		log.Println("received system message (ignored)")
 
 	case protocol.TypeChat:
+		message.Sender = user
 		hub.broadcastToRoom(message, conn, message.Room)
 
 	case protocol.TypeJoinRoom:
-		hub.addToRoom(conn, message.Sender, message.Room)
+		hub.addToRoom(conn, user, message.Room)
 		hub.broadcastToRoom(stamp(protocol.Message{
 			Type:    protocol.TypeSystem,
 			Room:    message.Room,
-			Content: fmt.Sprintf("%s joined the room", message.Sender),
+			Content: fmt.Sprintf("%s joined the room", user),
 		}), conn, message.Room)
 
 	case protocol.TypeLeaveRoom:
@@ -171,7 +246,7 @@ func handleMessage(raw []byte, conn *websocket.Conn) {
 		hub.broadcastToRoom(stamp(protocol.Message{
 			Type:    protocol.TypeSystem,
 			Room:    message.Room,
-			Content: fmt.Sprintf("%s left the room", message.Sender),
+			Content: fmt.Sprintf("%s left the room", user),
 		}), conn, message.Room)
 
 	default:
@@ -180,6 +255,15 @@ func handleMessage(raw []byte, conn *websocket.Conn) {
 }
 
 func main() {
+	var err error
+	db, err = database.Open("sethchat.db")
+	if err != nil {
+		log.Fatal("failed to open database:", err)
+	}
+	defer db.Close()
+
+	http.HandleFunc("/register", handleRegister)
+	http.HandleFunc("/login", handleLogin)
 	http.HandleFunc("/ws", handleConnection)
 	fmt.Println("server listening on :8080")
 	http.Handle("/", http.FileServer(http.Dir("./web")))

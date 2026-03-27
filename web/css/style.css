@@ -73,7 +73,8 @@
             letter-spacing: 0.08em;
         }
 
-        input[type="text"] {
+        input[type="text"],
+        input[type="password"] {
             background: var(--bg);
             border: 1px solid var(--border);
             color: var(--text);
@@ -85,7 +86,8 @@
             width: 100%;
         }
 
-        input[type="text"]:focus {
+        input[type="text"]:focus,
+        input[type="password"]:focus {
             border-color: var(--accent);
         }
 

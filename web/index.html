@@ -11,15 +11,23 @@
     <form id="loginForm">
         <h1>sethchat</h1>
         <p>Communications on this platform are not yet end-to-end encrypted. Communicate with caution.</p>
+        <p id="loginError" class="hidden"></p>
         <div class="field">
             <label for="username">Username</label>
             <input type="text" id="username" name="username" required autocomplete="off">
+        </div>
+        <div class="field">
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" required autocomplete="current-password">
         </div>
         <div class="field">
             <label for="room">Room</label>
             <input type="text" id="room" name="room" required autocomplete="off">
         </div>
         <button type="submit">Connect →</button>
+        <p style="font-size:0.78rem; color:var(--subtle); text-align:center; margin-top:0.5rem">
+            No account? <a href="#" id="toggleRegister" style="color:var(--accent)">Register</a>
+        </p>
     </form>
 
     <div id="chatContainer" class="hidden">
