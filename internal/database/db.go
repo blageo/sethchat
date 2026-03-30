@@ -56,6 +56,20 @@ func Open(path string) (*sql.DB, error) {
 		role    TEXT NOT NULL DEFAULT 'member',
 		FOREIGN KEY (user_id) REFERENCES users(user_id)
 	);
+	CREATE TABLE IF NOT EXISTS messages (
+		id         INTEGER PRIMARY KEY,
+		room_name  TEXT    NOT NULL,
+		sender     TEXT    NOT NULL,
+		content    TEXT    NOT NULL DEFAULT '',
+		media_url  TEXT    NOT NULL DEFAULT '',
+		media_type TEXT    NOT NULL DEFAULT '',
+		timestamp  TEXT    NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_messages_room ON messages (room_name, id);
+	CREATE TABLE IF NOT EXISTS media (
+		id           TEXT PRIMARY KEY,
+		content_type TEXT NOT NULL
+	);
 	`)
 
 	if err != nil {

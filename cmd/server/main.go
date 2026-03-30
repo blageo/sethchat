@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +31,9 @@ var upgrader = websocket.Upgrader{
 
 // db is the shared SQLite connection used by all HTTP and WebSocket handlers.
 var db *sql.DB
+
+// mediaDir is the directory where uploaded media files are stored on disk.
+var mediaDir string
 
 // Hub manages all active WebSocket connections, organized by room.
 // clients maps room name → (connection → username).
@@ -108,22 +113,10 @@ func stamp(m protocol.Message) protocol.Message {
 
 var hub = Hub{clients: make(map[string]map[*websocket.Conn]string)}
 
-// mediaItem holds an uploaded file in memory. Media is intentionally
-// non-persistent: the store is cleared when the server restarts.
-type mediaItem struct {
-	data        []byte
-	contentType string
-}
-
 const maxUploadSize = 50 << 20 // 50 MB
 
 // allowedMediaTypes lists MIME prefixes accepted for upload.
 var allowedMediaTypes = []string{"image/", "video/"}
-
-var (
-	mediaStore   = map[string]mediaItem{}
-	mediaStoreMu sync.RWMutex
-)
 
 // validateSessionParam reads ?session= from the request, validates it, and
 // returns the resolved userID. Writes an HTTP error and returns (0, false) on failure.
@@ -153,8 +146,9 @@ func lookupUsername(userID int64) (string, error) {
 	return name, err
 }
 
-// handleUpload accepts a multipart file upload from an authenticated user and
-// stores it in the in-memory media store. Returns JSON: {"url":"/media/<id>","type":"image/jpeg"}.
+// handleUpload accepts a multipart file upload from an authenticated user,
+// saves it to mediaDir on disk, and records its content type in the DB.
+// Returns JSON: {"url":"/media/<id>","type":"image/jpeg"}.
 // Accepted types: image/* and video/*. Max size: 50 MB.
 func handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -168,14 +162,14 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "file too large or malformed", http.StatusBadRequest)
 		return
 	}
-	file, header, err := r.FormFile("file")
+	file, _, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "missing file field", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
 
-	// Detect content type from the first 512 bytes, then re-read the rest.
+	// Detect content type from the first 512 bytes.
 	buf := make([]byte, 512)
 	n, _ := file.Read(buf)
 	contentType := http.DetectContentType(buf[:n])
@@ -192,16 +186,30 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read the remainder and prepend the already-read bytes.
-	rest := make([]byte, header.Size-int64(n))
-	file.Read(rest)
-	data := append(buf[:n], rest...)
-
-	// Use the UUID package already in go.mod via the auth package.
 	id := fmt.Sprintf("%d", time.Now().UnixNano())
-	mediaStoreMu.Lock()
-	mediaStore[id] = mediaItem{data: data, contentType: contentType}
-	mediaStoreMu.Unlock()
+	dst, err := os.Create(filepath.Join(mediaDir, id))
+	if err != nil {
+		log.Printf("handleUpload: create file: %v", err)
+		http.Error(w, "could not save file", http.StatusInternalServerError)
+		return
+	}
+	defer dst.Close()
+
+	// Write the already-read bytes, then copy the rest.
+	if _, err := dst.Write(buf[:n]); err != nil {
+		http.Error(w, "could not save file", http.StatusInternalServerError)
+		return
+	}
+	if _, err := dst.ReadFrom(file); err != nil {
+		http.Error(w, "could not save file", http.StatusInternalServerError)
+		return
+	}
+
+	if _, err := db.Exec("INSERT INTO media (id, content_type) VALUES (?, ?)", id, contentType); err != nil {
+		log.Printf("handleUpload: db insert: %v", err)
+		http.Error(w, "could not record upload", http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
@@ -210,22 +218,26 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleMedia serves a previously uploaded media item from the in-memory store.
+// handleMedia serves a previously uploaded media item from disk.
 func handleMedia(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/media/")
-	if id == "" {
+	if id == "" || strings.ContainsAny(id, "/\\") {
 		http.NotFound(w, r)
 		return
 	}
-	mediaStoreMu.RLock()
-	item, ok := mediaStore[id]
-	mediaStoreMu.RUnlock()
-	if !ok {
+	var contentType string
+	if err := db.QueryRow("SELECT content_type FROM media WHERE id = ?", id).Scan(&contentType); err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", item.contentType)
-	w.Write(item.data)
+	http.ServeContent(w, r, id, time.Time{}, mustOpen(filepath.Join(mediaDir, id)))
+}
+
+// mustOpen opens a file for http.ServeContent. Returns nil on error, which
+// causes ServeContent to respond with a 500 — acceptable for an internal helper.
+func mustOpen(path string) *os.File {
+	f, _ := os.Open(path)
+	return f
 }
 
 // getUserRole returns the squad role for userID: "owner", "admin", or "member".
@@ -419,6 +431,82 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"session_id": sessionID})
 }
 
+// saveMessage persists a chat message to the messages table.
+// Errors are logged but do not affect the caller — a failed write is non-fatal.
+func saveMessage(m protocol.Message) {
+	_, err := db.Exec(
+		`INSERT INTO messages (room_name, sender, content, media_url, media_type, timestamp)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		m.Room, m.Sender, m.Content, m.MediaURL, m.MediaType,
+		m.Timestamp.UTC().Format(time.RFC3339),
+	)
+	if err != nil {
+		log.Printf("saveMessage error: %v", err)
+	}
+}
+
+// handleHistory returns the most recent chat messages for a room.
+//
+//	GET /history?room=<name>&session=<sid>
+//	→ {"messages": [...]}  (chronological order, up to 50 messages)
+func handleHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, ok := validateSessionParam(w, r); !ok {
+		return
+	}
+	room := r.URL.Query().Get("room")
+	if room == "" {
+		http.Error(w, "room required", http.StatusBadRequest)
+		return
+	}
+
+	rows, err := db.Query(`
+		SELECT sender, content, media_url, media_type, timestamp
+		FROM (
+			SELECT id, sender, content, media_url, media_type, timestamp
+			FROM messages
+			WHERE room_name = ?
+			ORDER BY id DESC
+			LIMIT 50
+		) ORDER BY id ASC
+	`, room)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type historyMessage struct {
+		Type      string `json:"type"`
+		Room      string `json:"room"`
+		Sender    string `json:"sender"`
+		Content   string `json:"content"`
+		MediaURL  string `json:"mediaURL,omitempty"`
+		MediaType string `json:"mediaType,omitempty"`
+		Timestamp string `json:"timestamp"`
+	}
+	msgs := []historyMessage{}
+	for rows.Next() {
+		var m historyMessage
+		var mediaURL, mediaType string
+		if err := rows.Scan(&m.Sender, &m.Content, &mediaURL, &mediaType, &m.Timestamp); err != nil {
+			http.Error(w, "scan error", http.StatusInternalServerError)
+			return
+		}
+		m.Type = "chat"
+		m.Room = room
+		m.MediaURL = mediaURL
+		m.MediaType = mediaType
+		msgs = append(msgs, m)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"messages": msgs})
+}
+
 // handleRooms manages the persistent room list for the authenticated user.
 //
 //	GET    → {"rooms": ["general", "random"]}  (ordered by join time)
@@ -566,6 +654,7 @@ func handleMessage(raw []byte, conn *websocket.Conn, user string) {
 		// Override sender with the authenticated username.
 		message.Sender = user
 		hub.broadcastToRoom(message, conn, message.Room)
+		saveMessage(message)
 
 	case protocol.TypeJoinRoom:
 		hub.addToRoom(conn, user, message.Room)
@@ -593,7 +682,13 @@ func main() {
 	certFile := flag.String("cert", "", "TLS certificate file (PEM)")
 	keyFile := flag.String("key", "", "TLS key file (PEM)")
 	squadName := flag.String("squad-name", "My Squad", "Squad name shown to all members (used only on first run)")
+	mediaDirFlag := flag.String("media-dir", "./media", "directory for persisted media uploads")
 	flag.Parse()
+
+	mediaDir = *mediaDirFlag
+	if err := os.MkdirAll(mediaDir, 0755); err != nil {
+		log.Fatal("failed to create media directory:", err)
+	}
 
 	var err error
 	db, err = database.Open("sethchat.db")
@@ -610,6 +705,7 @@ func main() {
 	http.HandleFunc("/register", handleRegister)
 	http.HandleFunc("/login", handleLogin)
 	http.HandleFunc("/rooms", handleRooms)
+	http.HandleFunc("/history", handleHistory)
 	http.HandleFunc("/squad", handleSquad)
 	http.HandleFunc("/squad/members", handleSquadMembers)
 	http.HandleFunc("/upload", handleUpload)

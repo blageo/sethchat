@@ -30,6 +30,9 @@ go.work.sum
 # SQLite database
 *.db
 
+# Uploaded media files
+/media/
+
 # Editor/IDE
 .idea/
 .vscode/

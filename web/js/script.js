@@ -134,7 +134,11 @@
             })
             conn.send(JSON.stringify({ type: 'joinRoom', room: roomName }))
             joinedRooms.add(roomName)
-            messages[roomName] = []
+
+            // Load history before rendering so the room opens populated.
+            const histRes = await fetch(`/history?room=${encodeURIComponent(roomName)}&session=${sessionId}`)
+            messages[roomName] = histRes.ok ? (await histRes.json()).messages : []
+
             renderSidebar()
             if (activeRoom === null) switchToRoom(roomName)
         }
