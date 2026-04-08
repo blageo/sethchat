@@ -172,7 +172,17 @@
         // re-renders the message list from the stored history for that room.
         function switchToRoom(roomName) {
             activeRoom = roomName
-            headerRoom.textContent = roomName
+            const hashEl = document.querySelector('#chatHeader .hash')
+            if (roomName.startsWith('dm:')) {
+                const parts = roomName.split(':')
+                const lowerUser = user.toLowerCase()
+                const otherUser = parts[1] === lowerUser ? parts[2] : parts[1]
+                hashEl.textContent = '@'
+                headerRoom.textContent = otherUser
+            } else {
+                hashEl.textContent = '#'
+                headerRoom.textContent = roomName
+            }
             renderSidebar()
             renderMessageList()
         }
@@ -184,6 +194,7 @@
             const list = document.getElementById('roomList')
             list.innerHTML = ''
             for (const name of joinedRooms) {
+                if (name.startsWith('dm:')) continue
                 const item = document.createElement('div')
                 item.className = 'room-item' + (name === activeRoom ? ' active' : '')
                 item.innerHTML = `
@@ -193,6 +204,33 @@
                 `
                 item.querySelector('.room-label').addEventListener('click', () => switchToRoom(name))
                 item.querySelector('.room-hash').addEventListener('click', () => switchToRoom(name))
+                item.querySelector('.leave-btn').addEventListener('click', e => {
+                    e.stopPropagation()
+                    leaveRoom(name)
+                })
+                list.appendChild(item)
+            }
+            renderDMList()
+        }
+
+        // renderDMList rebuilds the #dmList element from DM entries in joinedRooms.
+        function renderDMList() {
+            const list = document.getElementById('dmList')
+            list.innerHTML = ''
+            for (const name of joinedRooms) {
+                if (!name.startsWith('dm:')) continue
+                const parts = name.split(':')
+                const lowerUser = user.toLowerCase()
+                const otherUser = parts[1] === lowerUser ? parts[2] : parts[1]
+                const item = document.createElement('div')
+                item.className = 'room-item' + (name === activeRoom ? ' active' : '')
+                item.innerHTML = `
+                    <span class="room-hash dm-sigil">@</span>
+                    <span class="room-label">${escapeHtml(otherUser)}</span>
+                    <button class="leave-btn" title="close">✕</button>
+                `
+                item.querySelector('.room-label').addEventListener('click', () => switchToRoom(name))
+                item.querySelector('.dm-sigil').addEventListener('click', () => switchToRoom(name))
                 item.querySelector('.leave-btn').addEventListener('click', e => {
                     e.stopPropagation()
                     leaveRoom(name)
@@ -357,6 +395,38 @@
             if (!name || !conn) return
             addRoomInput.value = ''
             joinRoom(name)
+        }
+
+        // ── Direct messages ───────────────────────────────
+
+        document.getElementById('newDMButton').addEventListener('click', openDMPicker)
+
+        async function openDMPicker() {
+            const res = await fetch(`/users?session=${sessionId}`)
+            const data = await res.json()
+            if (!data.users || data.users.length === 0) {
+                openModal('New Direct Message', '<p style="color:var(--subtle);font-size:0.82rem">No other members yet.</p>')
+                return
+            }
+            const rows = data.users.map(u =>
+                `<div class="member-item dm-picker-item" data-name="${escapeHtml(u.name)}" style="cursor:pointer">
+                    <span class="member-name">@ ${escapeHtml(u.name)}</span>
+                </div>`
+            ).join('')
+            openModal('New Direct Message', rows)
+            modalBody.querySelectorAll('.dm-picker-item').forEach(item => {
+                item.addEventListener('click', async () => {
+                    closeModal()
+                    const targetName = item.dataset.name
+                    const dmRes = await fetch(`/dm?session=${sessionId}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ username: targetName }),
+                    })
+                    const dmData = await dmRes.json()
+                    joinRoom(dmData.room)
+                })
+            })
         }
 
         // ── Squad header ──────────────────────────────────

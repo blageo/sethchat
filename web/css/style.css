@@ -595,3 +595,48 @@
         .hidden {
             display: none !important;
         }
+
+        /* ── DM section ───────────────────────────────── */
+
+        #dmSection {
+            border-top: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        #dmHeader {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.45rem 1rem 0.2rem;
+        }
+
+        #dmHeader span {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.65rem;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        #newDMButton {
+            background: transparent;
+            color: var(--accent);
+            font-size: 1rem;
+            padding: 0 0.3rem;
+            line-height: 1;
+        }
+
+        #newDMButton:hover { background: var(--accent-dim); }
+
+        #dmList {
+            overflow-y: auto;
+            max-height: 160px;
+            padding: 0.2rem 0 0.4rem;
+        }
+
+        #dmList::-webkit-scrollbar { width: 4px; }
+        #dmList::-webkit-scrollbar-track { background: transparent; }
+        #dmList::-webkit-scrollbar-thumb { background: var(--border); }
+
+        .room-item .dm-sigil { color: var(--muted); }
+        .room-item.active .dm-sigil { color: var(--accent); }

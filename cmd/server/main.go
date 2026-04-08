@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -112,6 +113,49 @@ func stamp(m protocol.Message) protocol.Message {
 }
 
 var hub = Hub{clients: make(map[string]map[*websocket.Conn]string)}
+
+// dmRoomName returns the canonical room name for a DM between users a and b.
+// Names are lowercased and sorted so dmRoomName("Alice","Bob") == dmRoomName("Bob","Alice").
+func dmRoomName(a, b string) string {
+	names := []string{strings.ToLower(a), strings.ToLower(b)}
+	sort.Strings(names)
+	return "dm:" + names[0] + ":" + names[1]
+}
+
+// RateLimiter enforces a per-user sliding-window rate limit on chat messages.
+type RateLimiter struct {
+	mu      sync.Mutex
+	windows map[string][]time.Time
+}
+
+const (
+	rateLimitMax    = 10
+	rateLimitWindow = 10 * time.Second
+)
+
+// Allow returns true if user is within the rate limit, false if they exceeded it.
+// It also evicts timestamps outside the current window.
+func (rl *RateLimiter) Allow(user string) bool {
+	now := time.Now()
+	cutoff := now.Add(-rateLimitWindow)
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	times := rl.windows[user]
+	valid := times[:0]
+	for _, t := range times {
+		if t.After(cutoff) {
+			valid = append(valid, t)
+		}
+	}
+	if len(valid) >= rateLimitMax {
+		rl.windows[user] = valid
+		return false
+	}
+	rl.windows[user] = append(valid, now)
+	return true
+}
+
+var rateLimiter = &RateLimiter{windows: make(map[string][]time.Time)}
 
 const maxUploadSize = 50 << 20 // 50 MB
 
@@ -651,12 +695,32 @@ func handleMessage(raw []byte, conn *websocket.Conn, user string) {
 		log.Println("received system message (ignored)")
 
 	case protocol.TypeChat:
+		if !rateLimiter.Allow(user) {
+			errMsg, _ := json.Marshal(stamp(protocol.Message{
+				Type:    protocol.TypeSystem,
+				Content: "you are sending messages too fast",
+			}))
+			conn.WriteMessage(websocket.TextMessage, errMsg)
+			return
+		}
 		// Override sender with the authenticated username.
 		message.Sender = user
 		hub.broadcastToRoom(message, conn, message.Room)
 		saveMessage(message)
 
 	case protocol.TypeJoinRoom:
+		if strings.HasPrefix(message.Room, "dm:") {
+			parts := strings.SplitN(message.Room, ":", 3)
+			lowerUser := strings.ToLower(user)
+			if len(parts) != 3 || (parts[1] != lowerUser && parts[2] != lowerUser) {
+				errMsg, _ := json.Marshal(stamp(protocol.Message{
+					Type:    protocol.TypeSystem,
+					Content: "you are not a participant in this conversation",
+				}))
+				conn.WriteMessage(websocket.TextMessage, errMsg)
+				return
+			}
+		}
 		hub.addToRoom(conn, user, message.Room)
 		hub.broadcastToRoom(stamp(protocol.Message{
 			Type:    protocol.TypeSystem,
@@ -675,6 +739,83 @@ func handleMessage(raw []byte, conn *websocket.Conn, user string) {
 	default:
 		log.Printf("unknown message type: %q", message.Type)
 	}
+}
+
+// handleUsers returns all squad members except the requesting user.
+//
+//	GET /users?session=<sid>  →  {"users": [{"name":"bob"}, ...]}
+func handleUsers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	userID, ok := validateSessionParam(w, r)
+	if !ok {
+		return
+	}
+	username, err := lookupUsername(userID)
+	if err != nil {
+		http.Error(w, "user not found", http.StatusInternalServerError)
+		return
+	}
+	rows, err := db.Query("SELECT name FROM users WHERE name != ? ORDER BY name ASC", username)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	type userEntry struct {
+		Name string `json:"name"`
+	}
+	users := []userEntry{}
+	for rows.Next() {
+		var u userEntry
+		if err := rows.Scan(&u.Name); err != nil {
+			http.Error(w, "scan error", http.StatusInternalServerError)
+			return
+		}
+		users = append(users, u)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"users": users})
+}
+
+// handleDM creates (or retrieves) a private DM conversation between the
+// requesting user and a named target. Both users' user_rooms are updated so
+// the conversation persists for both parties after reconnect.
+//
+//	POST /dm?session=<sid>  body: {"username":"bob"}  →  {"room":"dm:alice:bob"}
+func handleDM(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	userID, ok := validateSessionParam(w, r)
+	if !ok {
+		return
+	}
+	username, err := lookupUsername(userID)
+	if err != nil {
+		http.Error(w, "user not found", http.StatusInternalServerError)
+		return
+	}
+	var req struct {
+		Username string `json:"username"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Username == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	var targetID int64
+	if err := db.QueryRow("SELECT user_id FROM users WHERE name = ?", req.Username).Scan(&targetID); err != nil {
+		http.Error(w, "user not found", http.StatusNotFound)
+		return
+	}
+	room := dmRoomName(username, req.Username)
+	db.Exec("INSERT OR IGNORE INTO user_rooms (user_id, room_name) VALUES (?, ?)", userID, room)
+	db.Exec("INSERT OR IGNORE INTO user_rooms (user_id, room_name) VALUES (?, ?)", targetID, room)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"room": room})
 }
 
 func main() {
@@ -706,6 +847,8 @@ func main() {
 	http.HandleFunc("/login", handleLogin)
 	http.HandleFunc("/rooms", handleRooms)
 	http.HandleFunc("/history", handleHistory)
+	http.HandleFunc("/users", handleUsers)
+	http.HandleFunc("/dm", handleDM)
 	http.HandleFunc("/squad", handleSquad)
 	http.HandleFunc("/squad/members", handleSquadMembers)
 	http.HandleFunc("/upload", handleUpload)

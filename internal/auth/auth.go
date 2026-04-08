@@ -3,6 +3,7 @@ package auth
 import (
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,6 +13,7 @@ import (
 var ErrSessionExpired = errors.New("session expired")
 
 func Register(db *sql.DB, username, password string) (int64, error) {
+	username = strings.ToLower(strings.TrimSpace(username))
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return 0, err
@@ -24,6 +26,7 @@ func Register(db *sql.DB, username, password string) (int64, error) {
 }
 
 func Login(db *sql.DB, username, password string) (int64, error) {
+	username = strings.ToLower(strings.TrimSpace(username))
 	var userID int64
 	var hash []byte
 	err := db.QueryRow("SELECT user_id, password_hash FROM users WHERE name = ?", username).Scan(&userID, &hash)
