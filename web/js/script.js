@@ -22,6 +22,7 @@
         let activeRoom     = null          // currently displayed room name
         const messages     = {}           // { [roomName]: Message[] }
         const joinedRooms  = new Set()    // insertion-ordered set of joined rooms
+        const unread       = {}           // { [roomName]: number } unread counts
         let isRegisterMode = false
         let pendingMedia   = null         // { url, type, name } or null
         let squadInfo      = null         // { name, description, your_role }
@@ -78,6 +79,10 @@
                 loginForm.classList.add('hidden')
                 chatContainer.classList.remove('hidden')
 
+                if (Notification.permission === 'default') {
+                    Notification.requestPermission()
+                }
+
                 // Fetch squad info and render the sidebar header.
                 const squadRes = await fetch(`/squad?session=${sessionId}`)
                 squadInfo = await squadRes.json()
@@ -113,6 +118,16 @@
                 // Only render to DOM if the message belongs to the visible room.
                 if (msgRoom === activeRoom) {
                     appendMessageToDOM(message, messageList)
+                } else if (message.type === 'chat') {
+                    unread[msgRoom] = (unread[msgRoom] || 0) + 1
+                    renderSidebar()
+                    updateTitle()
+                    if (msgRoom.startsWith('dm:') && Notification.permission === 'granted' && !document.hasFocus()) {
+                        new Notification(`DM from ${message.sender}`, {
+                            body: message.content || '📎 media',
+                            tag:  msgRoom,
+                        })
+                    }
                 }
             }
         })
@@ -172,6 +187,8 @@
         // re-renders the message list from the stored history for that room.
         function switchToRoom(roomName) {
             activeRoom = roomName
+            delete unread[roomName]
+            updateTitle()
             const hashEl = document.querySelector('#chatHeader .hash')
             if (roomName.startsWith('dm:')) {
                 const parts = roomName.split(':')
@@ -187,6 +204,11 @@
             renderMessageList()
         }
 
+        function updateTitle() {
+            const total = Object.values(unread).reduce((sum, n) => sum + n, 0)
+            document.title = total > 0 ? `(${total}) sethchat` : 'sethchat'
+        }
+
         // ── Rendering ─────────────────────────────────────
 
         // renderSidebar rebuilds the #roomList element from the joinedRooms Set.
@@ -195,12 +217,16 @@
             list.innerHTML = ''
             for (const name of joinedRooms) {
                 if (name.startsWith('dm:')) continue
+                const count = unread[name] || 0
                 const item = document.createElement('div')
                 item.className = 'room-item' + (name === activeRoom ? ' active' : '')
                 item.innerHTML = `
                     <span class="room-hash">#</span>
                     <span class="room-label">${escapeHtml(name)}</span>
-                    <button class="leave-btn" title="leave">✕</button>
+                    <span class="room-end">
+                        ${count ? `<span class="unread-badge">${count}</span>` : ''}
+                        <button class="leave-btn" title="leave">✕</button>
+                    </span>
                 `
                 item.querySelector('.room-label').addEventListener('click', () => switchToRoom(name))
                 item.querySelector('.room-hash').addEventListener('click', () => switchToRoom(name))
@@ -222,12 +248,16 @@
                 const parts = name.split(':')
                 const lowerUser = user.toLowerCase()
                 const otherUser = parts[1] === lowerUser ? parts[2] : parts[1]
+                const count = unread[name] || 0
                 const item = document.createElement('div')
                 item.className = 'room-item' + (name === activeRoom ? ' active' : '')
                 item.innerHTML = `
                     <span class="room-hash dm-sigil">@</span>
                     <span class="room-label">${escapeHtml(otherUser)}</span>
-                    <button class="leave-btn" title="close">✕</button>
+                    <span class="room-end">
+                        ${count ? `<span class="unread-badge">${count}</span>` : ''}
+                        <button class="leave-btn" title="close">✕</button>
+                    </span>
                 `
                 item.querySelector('.room-label').addEventListener('click', () => switchToRoom(name))
                 item.querySelector('.dm-sigil').addEventListener('click', () => switchToRoom(name))

@@ -223,8 +223,30 @@
         .room-item .room-hash { color: var(--muted); }
         .room-item.active .room-hash { color: var(--accent); }
 
-        .room-item .leave-btn {
+        .room-end {
             margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 0.3rem;
+            flex-shrink: 0;
+        }
+
+        .unread-badge {
+            background: var(--accent);
+            color: #0f0f0f;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.6rem;
+            font-weight: 500;
+            min-width: 1.2rem;
+            height: 1.2rem;
+            border-radius: 1rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0 0.3rem;
+        }
+
+        .room-item .leave-btn {
             background: transparent;
             color: var(--muted);
             font-size: 0.7rem;
