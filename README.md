@@ -125,7 +125,7 @@ Messages are JSON-encoded WebSocket frames:
 
 - [x] Authentication (registration, login, sessions)
 - [x] Server structure (squads) i.e. collections of rooms.
-- [ ] Message persistence (database)
+- [x] Message persistence (database)
 - [x] HTTPS / WSS support
 - [x] Media sharing (images, GIFs)
 - [ ] Docker packaging for easy self-hosting
