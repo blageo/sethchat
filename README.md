@@ -1,6 +1,6 @@
 # sethchat
 
-A self-hosted group chat application built with Go and WebSockets. Designed to be simple, lightweight, and deployable for small groups who want their own private chat without relying on third-party platforms.
+A self-hosted group chat application built with Go and WebSockets. Designed to be simple, lightweight, and deployable for small groups who want their own private chat without relying on third-party platforms. This was built as a personal project for Boot.Dev.
 
 > ⚠️ **Note:** Communications are not end-to-end encrypted. Not recommended for sensitive communications.
 
@@ -58,13 +58,11 @@ go run ./cmd/server/main.go
 
 The server listens on `:8080` and serves the web client at `http://localhost:8080`. A `sethchat.db` SQLite database is created automatically in the working directory on first run.
 
-**First-run squad setup:** The first user to register becomes the squad owner. The squad name defaults to `My Squad` and can be changed at any time by the owner via the in-app settings panel. To set a different name on first startup:
+**First-run squad setup:** The first user to register becomes the squad owner. Use `-squad-name` to set the squad name on initial startup (ignored on subsequent runs):
 
 ```bash
 go run ./cmd/server/main.go -squad-name "My Squad"
 ```
-
-> Note: `-squad-name` is only applied on the first run. Once the database exists, the name is managed through the app.
 
 ### Running with TLS
 
@@ -89,38 +87,13 @@ Open `http://localhost:8080`, register an account or log in, then use the sideba
 - Click the 📎 button to select a file from disk
 - Paste an image directly from the clipboard (`Ctrl+V` / `Cmd+V`) while the message box is focused
 
-### Using the CLI client
+### CLI client
 
 ```bash
 go run ./cmd/client/main.go --user yourname --room general
 ```
 
-**CLI commands:**
-
-| Command | Description |
-|---|---|
-| `/join <room>` | Leave current room and join a new one |
-| `/leave` | Leave the current room |
-| `/room` | Display the current room |
-
 > Note: The CLI client connects without authentication and is intended for local development use.
-
-## HTTP API
-
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| `POST` | `/register` | — | Create an account. Body: `{"username":"…","password":"…"}` |
-| `POST` | `/login` | — | Log in. Returns `{"session_id":"…"}` |
-| `GET` | `/rooms` | `?session=` | List the user's saved rooms |
-| `POST` | `/rooms` | `?session=` | Add a room. Body: `{"room":"…"}` |
-| `DELETE` | `/rooms` | `?session=` | Remove a room. Body: `{"room":"…"}` |
-| `GET` | `/squad` | `?session=` | Get squad info and your role. Returns `{"name":"…","description":"…","your_role":"…"}` |
-| `PATCH` | `/squad` | `?session=` | Update squad name/description (owner only). Body: `{"name":"…","description":"…"}` |
-| `GET` | `/squad/members` | `?session=` | List all members ordered by role |
-| `PATCH` | `/squad/members` | `?session=` | Change a member's role (owner only). Body: `{"user_id":2,"role":"admin"}` |
-| `POST` | `/upload` | `?session=` | Upload media (multipart, max 50 MB). Returns `{"url":"…","type":"…"}` |
-| `GET` | `/media/<id>` | — | Serve an uploaded media file |
-| `GET` | `/ws` | `?session=` | Upgrade to WebSocket |
 
 ## Protocol
 
@@ -151,7 +124,7 @@ Messages are JSON-encoded WebSocket frames:
 ## Roadmap
 
 - [x] Authentication (registration, login, sessions)
-- [x] Server structure (squads) i.e. collections of rooms. One instance of sethchat = 1 squad. 
+- [x] Server structure (squads) i.e. collections of rooms.
 - [ ] Message persistence (database)
 - [x] HTTPS / WSS support
 - [x] Media sharing (images, GIFs)
