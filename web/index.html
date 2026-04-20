@@ -10,7 +10,7 @@
 <body>
     <form id="loginForm">
         <h1>sethchat</h1>
-        <p>Communications on this platform are not yet end-to-end encrypted. Communicate with caution.</p>
+        <p>All messages are end-to-end encrypted. Keys are stored locally in your browser.</p>
         <p id="loginError" class="hidden"></p>
         <div class="field">
             <label for="username">Username</label>
@@ -84,6 +84,7 @@
         </div>
     </div>
 
+    <script src="js/crypto.js"></script>
     <script src="js/script.js"></script>
 </body>
 </html>

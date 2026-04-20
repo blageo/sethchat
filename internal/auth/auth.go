@@ -25,17 +25,24 @@ func Register(db *sql.DB, username, password string) (int64, error) {
 	return result.LastInsertId()
 }
 
+// dummyHash is a pre-computed bcrypt hash used when the queried user does not
+// exist. Running CompareHashAndPassword against it ensures the response time is
+// indistinguishable from a valid-user/wrong-password failure, preventing
+// username enumeration via timing.
+var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("dummy"), bcrypt.DefaultCost)
+
 func Login(db *sql.DB, username, password string) (int64, error) {
 	username = strings.ToLower(strings.TrimSpace(username))
 	var userID int64
 	var hash []byte
 	err := db.QueryRow("SELECT user_id, password_hash FROM users WHERE name = ?", username).Scan(&userID, &hash)
 	if err != nil {
-		return 0, err
+		// User not found — still run bcrypt to avoid timing-based username enumeration.
+		bcrypt.CompareHashAndPassword(dummyHash, []byte(password)) //nolint:errcheck
+		return 0, errors.New("invalid credentials")
 	}
-	err = bcrypt.CompareHashAndPassword(hash, []byte(password))
-	if err != nil {
-		return 0, err
+	if err := bcrypt.CompareHashAndPassword(hash, []byte(password)); err != nil {
+		return 0, errors.New("invalid credentials")
 	}
 	return userID, nil
 }

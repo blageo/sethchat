@@ -16,16 +16,20 @@
         const pendingMediaName = document.getElementById('pendingMediaName')
         const clearMediaButton = document.getElementById('clearMediaButton')
 
-        let conn           = null
-        let user           = null
-        let sessionId      = null
-        let activeRoom     = null          // currently displayed room name
-        const messages     = {}           // { [roomName]: Message[] }
-        const joinedRooms  = new Set()    // insertion-ordered set of joined rooms
-        const unread       = {}           // { [roomName]: number } unread counts
-        let isRegisterMode = false
-        let pendingMedia   = null         // { url, type, name } or null
-        let squadInfo      = null         // { name, description, your_role }
+        let conn              = null
+        let user              = null
+        let sessionId         = null
+        let activeRoom        = null          // currently displayed room name
+        const messages        = {}           // { [roomName]: Message[] }
+        const joinedRooms     = new Set()    // insertion-ordered set of joined rooms
+        const unread          = {}           // { [roomName]: number } unread counts
+        let isRegisterMode    = false
+        let pendingMedia      = null         // { url, type, name } or null
+        let squadInfo         = null         // { name, description, your_role }
+        let identityKeypair   = null         // { privateKey, publicKey } — ECDH P-256
+        let ownPubKeyB64      = null         // base64(SPKI) of own public key
+        const pendingKeyRooms = new Set()    // rooms waiting for key distribution
+        const messageBuffer   = {}           // { [roomName]: Message[] } — encrypted msgs buffered until key arrives
 
         // ── Login / Register ──────────────────────────────
 
@@ -83,6 +87,17 @@
                     Notification.requestPermission()
                 }
 
+                // Initialize E2EE identity keypair (generates on first login, loads on subsequent).
+                identityKeypair = await E2EE.generateOrLoadIdentityKey(user)
+                ownPubKeyB64    = await E2EE.exportPublicKey(identityKeypair.publicKey)
+                // Register/update our public key with the server so other members can
+                // encrypt the room key for us (e.g. when we join a new device).
+                await fetch(`/keys?session=${sessionId}`, {
+                    method:  'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body:    JSON.stringify({ public_key: ownPubKeyB64 }),
+                })
+
                 // Fetch squad info and render the sidebar header.
                 const squadRes = await fetch(`/squad?session=${sessionId}`)
                 squadInfo = await squadRes.json()
@@ -103,16 +118,131 @@
                 }
             }
 
-            conn.onclose = function() {
+            conn.onclose = async function() {
                 console.log('Connection closed')
+                // Invalidate the session server-side on clean close so the token
+                // cannot be reused after the user navigates away or closes the tab.
+                if (sessionId) {
+                    navigator.sendBeacon(`/logout?session=${sessionId}`)
+                    sessionId = null
+                }
             }
 
-            conn.onmessage = function(event) {
+            conn.onmessage = async function(event) {
                 const message = JSON.parse(event.data)
                 // Route message to its room bucket; fall back to activeRoom for
                 // any server messages that don't carry a room field.
                 const msgRoom = message.room || activeRoom
                 if (!msgRoom) return
+
+                // ── E2EE key exchange handling ───────────────────────────────
+
+                if (message.type === 'keyRequest' && message.sender !== user) {
+                    // Another member needs the room key — distribute it if we have it.
+                    const roomKey = await E2EE.getRoomKey(msgRoom)
+                    if (!roomKey) return // we don't have it either
+                    try {
+                        const theirPub = await E2EE.importPublicKey(message.publicKey)
+                        const { encrypted_key, key_iv } = await E2EE.encryptRoomKeyForUser(
+                            roomKey, identityKeypair.privateKey, theirPub
+                        )
+                        // Deliver over WebSocket for immediate decryption.
+                        conn.send(JSON.stringify({
+                            type:    'keyDistribute',
+                            room:    msgRoom,
+                            content: JSON.stringify({
+                                for:              message.sender,
+                                encrypted_key,
+                                key_iv,
+                                sender_public_key: ownPubKeyB64,
+                            }),
+                        }))
+                        // Persist to server so the recipient can load it on future logins.
+                        fetch(`/room-key?session=${sessionId}`, {
+                            method:  'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body:    JSON.stringify({
+                                room:             msgRoom,
+                                for_user:         message.sender,
+                                encrypted_key,
+                                key_iv,
+                                sender_public_key: ownPubKeyB64,
+                            }),
+                        })
+                    } catch (err) {
+                        console.error('keyRequest handling failed:', err)
+                    }
+                    return
+                }
+
+                if (message.type === 'keyDistribute') {
+                    // We received an encrypted room key — attempt to decrypt it.
+                    try {
+                        const payload = JSON.parse(message.content)
+                        if (payload.for !== user) return // not for us
+                        const key = await E2EE.decryptRoomKey(
+                            payload.encrypted_key,
+                            payload.key_iv,
+                            payload.sender_public_key,
+                            identityKeypair.privateKey,
+                            msgRoom,
+                        )
+                        pendingKeyRooms.delete(msgRoom)
+                        // Decrypt and replay any buffered messages for this room.
+                        if (messageBuffer[msgRoom]) {
+                            for (const buffered of messageBuffer[msgRoom]) {
+                                try {
+                                    buffered.content = await E2EE.decryptMessage(buffered.content, buffered.iv, key)
+                                } catch (_) { buffered.content = '[decryption failed]' }
+                                if (!messages[msgRoom]) messages[msgRoom] = []
+                                messages[msgRoom].push(buffered)
+                            }
+                            delete messageBuffer[msgRoom]
+                        }
+                        // Decrypt any history messages that are still showing as encrypted.
+                        if (messages[msgRoom]) {
+                            for (const m of messages[msgRoom]) {
+                                if (m.encrypted && m._raw) {
+                                    try {
+                                        m.content = await E2EE.decryptMessage(m._raw, m.iv, key)
+                                    } catch (_) { m.content = '[decryption failed]' }
+                                    m.encrypted = false
+                                }
+                            }
+                        }
+                        if (msgRoom === activeRoom) renderMessageList()
+                    } catch (err) {
+                        console.error('keyDistribute handling failed:', err)
+                    }
+                    return
+                }
+
+                // ── Decrypt chat messages ────────────────────────────────────
+
+                if (message.type === 'chat' && message.encrypted) {
+                    const roomKey = await E2EE.getRoomKey(msgRoom)
+                    if (!roomKey) {
+                        // Key not yet available — buffer the message.
+                        if (!messageBuffer[msgRoom]) messageBuffer[msgRoom] = []
+                        messageBuffer[msgRoom].push(message)
+                        return
+                    }
+                    try {
+                        message.content = await E2EE.decryptMessage(message.content, message.iv, roomKey)
+                    } catch (_) {
+                        message.content = '[decryption failed]'
+                    }
+                }
+
+                // ── Key rotation on member leave ─────────────────────────────
+
+                if (message.type === 'system' && message.content && message.content.endsWith(' left the room')) {
+                    // Elect coordinator: alphabetically first current member rotates the key.
+                    rotateRoomKeyIfCoordinator(msgRoom)
+                }
+
+                // ── Normal message routing ───────────────────────────────────
+
                 if (!messages[msgRoom]) messages[msgRoom] = []
                 messages[msgRoom].push(message)
                 // Only render to DOM if the message belongs to the visible room.
@@ -150,12 +280,89 @@
             conn.send(JSON.stringify({ type: 'joinRoom', room: roomName }))
             joinedRooms.add(roomName)
 
-            // Load history before rendering so the room opens populated.
+            // Load history before resolving the room key so we can decide
+            // whether this is the first join (empty history → generate key).
             const histRes = await fetch(`/history?room=${encodeURIComponent(roomName)}&session=${sessionId}`)
-            messages[roomName] = histRes.ok ? (await histRes.json()).messages : []
+            const histMsgs = histRes.ok ? (await histRes.json()).messages : []
+
+            // ── Room key setup ───────────────────────────────────────────────
+            await setupRoomKey(roomName, histMsgs)
+
+            // Decrypt any history messages that are encrypted.
+            const roomKey = await E2EE.getRoomKey(roomName)
+            messages[roomName] = []
+            for (const m of histMsgs) {
+                if (m.encrypted && roomKey) {
+                    try {
+                        m.content = await E2EE.decryptMessage(m.content, m.iv, roomKey)
+                    } catch (_) {
+                        m._raw     = m.content
+                        m.content  = '[encrypted — waiting for key]'
+                    }
+                } else if (m.encrypted && !roomKey) {
+                    m._raw    = m.content
+                    m.content = '[encrypted — waiting for key]'
+                }
+                messages[roomName].push(m)
+            }
 
             renderSidebar()
             if (activeRoom === null) switchToRoom(roomName)
+        }
+
+        // setupRoomKey fetches or generates the room key for roomName.
+        // histMsgs is the list of historical messages (used to detect first join).
+        async function setupRoomKey(roomName, histMsgs) {
+            // Try to load existing key from IndexedDB first (avoids a server round-trip on re-render).
+            const cached = await E2EE.getRoomKey(roomName)
+            if (cached) return
+
+            // Try to fetch our encrypted copy from the server.
+            const res = await fetch(`/room-key?room=${encodeURIComponent(roomName)}&session=${sessionId}`)
+            if (res.ok) {
+                const data = await res.json()
+                try {
+                    await E2EE.decryptRoomKey(
+                        data.encrypted_key,
+                        data.key_iv,
+                        data.sender_public_key,
+                        identityKeypair.privateKey,
+                        roomName,
+                    )
+                } catch (err) {
+                    console.error('Failed to decrypt room key from server:', err)
+                }
+                return
+            }
+
+            // No key on server for us yet.
+            if (histMsgs.length === 0) {
+                // First member in this room — generate and store a new room key.
+                const newKey = await E2EE.generateRoomKey()
+                await E2EE.storeRoomKey(roomName, newKey)
+                const { encrypted_key, key_iv } = await E2EE.encryptRoomKeyForUser(
+                    newKey, identityKeypair.privateKey, identityKeypair.publicKey
+                )
+                await fetch(`/room-key?session=${sessionId}`, {
+                    method:  'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body:    JSON.stringify({
+                        room:             roomName,
+                        for_user:         user,
+                        encrypted_key,
+                        key_iv,
+                        sender_public_key: ownPubKeyB64,
+                    }),
+                })
+            } else {
+                // Existing room — request the key from an online member.
+                pendingKeyRooms.add(roomName)
+                conn.send(JSON.stringify({
+                    type:      'keyRequest',
+                    room:      roomName,
+                    publicKey: ownPubKeyB64,
+                }))
+            }
         }
 
         // leaveRoom removes the room from the server, sends a WS leaveRoom message,
@@ -388,22 +595,42 @@
 
         // ── Sending messages ──────────────────────────────
 
-        function sendChat() {
+        async function sendChat() {
             const content = messageInput.value.trim()
             if (!content && !pendingMedia) return
             if (!conn || !activeRoom) return
 
-            const msg = {
-                type:    'chat',
-                sender:  user,
-                room:    activeRoom,
-                content: content,
+            const roomKey = await E2EE.getRoomKey(activeRoom)
+            if (!roomKey) {
+                // Room key not yet available — show transient hint and bail.
+                const orig = messageInput.placeholder
+                messageInput.placeholder = 'Waiting for room key from an online member…'
+                setTimeout(() => { messageInput.placeholder = orig }, 3000)
+                return
             }
+
+            const msg = {
+                type:   'chat',
+                sender: user,
+                room:   activeRoom,
+            }
+
+            // Encrypt text content if present.
+            if (content) {
+                const { ciphertext, iv } = await E2EE.encryptMessage(content, roomKey)
+                msg.content   = ciphertext
+                msg.iv        = iv
+                msg.encrypted = true
+            } else {
+                msg.content = ''
+            }
+
             if (pendingMedia) {
                 msg.mediaURL  = pendingMedia.url
                 msg.mediaType = pendingMedia.type
                 clearPendingMedia()
             }
+
             conn.send(JSON.stringify(msg))
             messageInput.value = ''
         }
@@ -575,7 +802,67 @@
             }
         }
 
+        // ── Key rotation ──────────────────────────────────
+
+        // rotateRoomKeyIfCoordinator generates a new room key when a member leaves,
+        // but only if this client is the alphabetically-first current member (to
+        // avoid every member doing the same work simultaneously).
+        async function rotateRoomKeyIfCoordinator(roomName) {
+            if (!joinedRooms.has(roomName)) return
+            const roomKey = await E2EE.getRoomKey(roomName)
+            if (!roomKey) return
+
+            // Fetch current member list to determine coordinator.
+            const res = await fetch(`/room/members?room=${encodeURIComponent(roomName)}&session=${sessionId}`)
+            if (!res.ok) return
+            const { members } = await res.json()
+            if (!members || members.length === 0) return
+
+            // Only the alphabetically-first member performs rotation.
+            const sorted = [...members].sort()
+            if (sorted[0].toLowerCase() !== user.toLowerCase()) return
+
+            // Generate new room key.
+            const newKey = await E2EE.generateRoomKey()
+            await E2EE.storeRoomKey(roomName, newKey)
+
+            // Encrypt and persist for all current members (including self).
+            for (const memberName of members) {
+                try {
+                    const keyRes = await fetch(`/keys?username=${encodeURIComponent(memberName)}&session=${sessionId}`)
+                    if (!keyRes.ok) continue
+                    const { public_key } = await keyRes.json()
+                    const theirPub = await E2EE.importPublicKey(public_key)
+                    const { encrypted_key, key_iv } = await E2EE.encryptRoomKeyForUser(
+                        newKey, identityKeypair.privateKey, theirPub
+                    )
+                    await fetch(`/room-key?session=${sessionId}`, {
+                        method:  'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body:    JSON.stringify({
+                            room:             roomName,
+                            for_user:         memberName,
+                            encrypted_key,
+                            key_iv,
+                            sender_public_key: ownPubKeyB64,
+                        }),
+                    })
+                } catch (err) {
+                    console.error(`Key rotation failed for ${memberName}:`, err)
+                }
+            }
+        }
+
         // ── Utilities ─────────────────────────────────────
+
+        // Invalidate session when the page unloads (tab close, navigation away).
+        // sendBeacon is used because it survives the page teardown.
+        window.addEventListener('beforeunload', () => {
+            if (sessionId) {
+                navigator.sendBeacon(`/logout?session=${sessionId}`)
+                sessionId = null
+            }
+        })
 
         function escapeHtml(str) {
             return str

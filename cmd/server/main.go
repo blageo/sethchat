@@ -22,11 +22,23 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// upgrader promotes HTTP connections to WebSocket. CheckOrigin is permissive
-// since sethchat is intended for trusted private networks, not the public web.
+// upgrader promotes HTTP connections to WebSocket.
+// CheckOrigin validates that the Origin header matches the Host so that
+// cross-origin WebSocket connections from arbitrary websites are rejected.
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		return true
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true // non-browser clients (CLI, curl) have no Origin header
+		}
+		// Strip scheme from origin so we can compare to Host.
+		for _, prefix := range []string{"https://", "http://", "wss://", "ws://"} {
+			if strings.HasPrefix(origin, prefix) {
+				origin = origin[len(prefix):]
+				break
+			}
+		}
+		return origin == r.Host
 	},
 }
 
@@ -85,7 +97,8 @@ func (h *Hub) removeFromAll(conn *websocket.Conn) {
 }
 
 // broadcastToRoom sends message to every connection currently in room.
-// Write errors are logged but do not abort the broadcast to other clients.
+// Write errors are logged; any connection that fails to receive is removed from
+// all rooms to prevent the hub from accumulating stale connections.
 func (h *Hub) broadcastToRoom(message protocol.Message, sender *websocket.Conn, room string) {
 	mes, err := json.Marshal(message)
 	if err != nil {
@@ -94,12 +107,25 @@ func (h *Hub) broadcastToRoom(message protocol.Message, sender *websocket.Conn, 
 	}
 
 	h.mu.RLock()
-	defer h.mu.RUnlock()
+	var stale []*websocket.Conn
 	log.Printf("broadcasting to room %s, %d clients", room, len(h.clients[room]))
 	for conn := range h.clients[room] {
 		if err := conn.WriteMessage(websocket.TextMessage, mes); err != nil {
-			log.Println("write error:", err)
+			log.Println("write error (marking stale):", err)
+			stale = append(stale, conn)
 		}
+	}
+	h.mu.RUnlock()
+
+	// Evict stale connections outside the read lock to avoid deadlock.
+	if len(stale) > 0 {
+		h.mu.Lock()
+		for _, conn := range stale {
+			for r := range h.clients {
+				delete(h.clients[r], conn)
+			}
+		}
+		h.mu.Unlock()
 	}
 }
 
@@ -156,6 +182,75 @@ func (rl *RateLimiter) Allow(user string) bool {
 }
 
 var rateLimiter = &RateLimiter{windows: make(map[string][]time.Time)}
+
+// authLimiter enforces a per-IP rate limit on authentication endpoints
+// (/login, /register) to mitigate brute-force and credential stuffing attacks.
+// Limit: 10 attempts per 60 seconds per IP.
+var authLimiter = &RateLimiter{windows: make(map[string][]time.Time)}
+
+const (
+	authLimitMax    = 10
+	authLimitWindow = 60 * time.Second
+)
+
+// Allow (auth variant) uses the authentication-specific limits.
+func authRateAllow(ip string) bool {
+	now := time.Now()
+	cutoff := now.Add(-authLimitWindow)
+	authLimiter.mu.Lock()
+	defer authLimiter.mu.Unlock()
+	times := authLimiter.windows[ip]
+	valid := times[:0]
+	for _, t := range times {
+		if t.After(cutoff) {
+			valid = append(valid, t)
+		}
+	}
+	if len(valid) >= authLimitMax {
+		authLimiter.windows[ip] = valid
+		return false
+	}
+	authLimiter.windows[ip] = append(valid, now)
+	return true
+}
+
+// remoteIP extracts the client IP from r.RemoteAddr ("host:port"), stripping the port.
+func remoteIP(r *http.Request) string {
+	if h, _, ok := strings.Cut(r.RemoteAddr, ":"); ok {
+		return h
+	}
+	return r.RemoteAddr
+}
+
+// securityHeaders is a middleware that adds defensive HTTP headers to every
+// response served by the mux.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Prevent MIME-type sniffing attacks (e.g. polyglot image/JS files).
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		// Deny framing to block clickjacking.
+		w.Header().Set("X-Frame-Options", "DENY")
+		// Basic XSS filter for older browsers.
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		// Restrict resource loading: default-src self; block inline scripts except
+		// the app itself; allow Google Fonts and WebSocket upgrade.
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'self'; "+
+				"script-src 'self'; "+
+				"style-src 'self' https://fonts.googleapis.com; "+
+				"font-src https://fonts.gstatic.com; "+
+				"img-src 'self' blob: data:; "+
+				"media-src 'self' blob:; "+
+				"connect-src 'self' ws: wss:;")
+		// HSTS: instruct browsers to use HTTPS for 1 year (only meaningful over TLS).
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		// Do not send Referrer to external origins.
+		w.Header().Set("Referrer-Policy", "same-origin")
+		next.ServeHTTP(w, r)
+	})
+}
+
+const maxRoomNameLen = 64
 
 const maxUploadSize = 50 << 20 // 50 MB
 
@@ -303,6 +398,10 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !authRateAllow(remoteIP(r)) {
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -311,20 +410,39 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	if len(req.Username) == 0 || len(req.Username) > 32 {
+		http.Error(w, "username must be 1–32 characters", http.StatusBadRequest)
+		return
+	}
+	if len(req.Password) < 8 {
+		http.Error(w, "password must be at least 8 characters", http.StatusBadRequest)
+		return
+	}
 	userID, err := auth.Register(db, req.Username, req.Password)
 	if err != nil {
-		http.Error(w, "registration failed: "+err.Error(), http.StatusConflict)
+		// Return a generic error to avoid leaking whether the username exists.
+		http.Error(w, "registration failed", http.StatusConflict)
 		return
 	}
 
-	// Assign role: owner if no owner exists yet, otherwise member.
-	role := "member"
+	// Assign role atomically: owner if no owner exists yet, otherwise member.
+	// The transaction prevents a race where two simultaneous registrations
+	// both observe ownerCount==0 and both claim the owner role.
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("handleRegister: begin tx: %v", err)
+		w.WriteHeader(http.StatusCreated) // user created; role defaults to member
+		return
+	}
+	defer tx.Rollback()
 	var ownerCount int
-	db.QueryRow("SELECT COUNT(*) FROM user_squad_roles WHERE role = 'owner'").Scan(&ownerCount)
+	tx.QueryRow("SELECT COUNT(*) FROM user_squad_roles WHERE role = 'owner'").Scan(&ownerCount)
+	role := "member"
 	if ownerCount == 0 {
 		role = "owner"
 	}
-	db.Exec("INSERT INTO user_squad_roles (user_id, role) VALUES (?, ?)", userID, role)
+	tx.Exec("INSERT OR IGNORE INTO user_squad_roles (user_id, role) VALUES (?, ?)", userID, role)
+	tx.Commit()
 
 	w.WriteHeader(http.StatusCreated)
 }
@@ -453,6 +571,10 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !authRateAllow(remoteIP(r)) {
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -475,14 +597,36 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"session_id": sessionID})
 }
 
+// handleLogout invalidates the caller's current session token.
+//
+//	POST /logout?session=<sid>  → 204
+func handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	sid := r.URL.Query().Get("session")
+	if sid == "" {
+		http.Error(w, "session required", http.StatusBadRequest)
+		return
+	}
+	db.Exec("DELETE FROM sessions WHERE session_id = ?", sid)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // saveMessage persists a chat message to the messages table.
 // Errors are logged but do not affect the caller — a failed write is non-fatal.
 func saveMessage(m protocol.Message) {
+	isEncrypted := 0
+	if m.Encrypted {
+		isEncrypted = 1
+	}
 	_, err := db.Exec(
-		`INSERT INTO messages (room_name, sender, content, media_url, media_type, timestamp)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO messages (room_name, sender, content, media_url, media_type, timestamp, iv, is_encrypted)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.Room, m.Sender, m.Content, m.MediaURL, m.MediaType,
 		m.Timestamp.UTC().Format(time.RFC3339),
+		m.IV, isEncrypted,
 	)
 	if err != nil {
 		log.Printf("saveMessage error: %v", err)
@@ -508,9 +652,9 @@ func handleHistory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := db.Query(`
-		SELECT sender, content, media_url, media_type, timestamp
+		SELECT sender, content, media_url, media_type, timestamp, iv, is_encrypted
 		FROM (
-			SELECT id, sender, content, media_url, media_type, timestamp
+			SELECT id, sender, content, media_url, media_type, timestamp, iv, is_encrypted
 			FROM messages
 			WHERE room_name = ?
 			ORDER BY id DESC
@@ -524,19 +668,22 @@ func handleHistory(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type historyMessage struct {
-		Type      string `json:"type"`
-		Room      string `json:"room"`
-		Sender    string `json:"sender"`
-		Content   string `json:"content"`
-		MediaURL  string `json:"mediaURL,omitempty"`
-		MediaType string `json:"mediaType,omitempty"`
-		Timestamp string `json:"timestamp"`
+		Type        string `json:"type"`
+		Room        string `json:"room"`
+		Sender      string `json:"sender"`
+		Content     string `json:"content"`
+		MediaURL    string `json:"mediaURL,omitempty"`
+		MediaType   string `json:"mediaType,omitempty"`
+		Timestamp   string `json:"timestamp"`
+		IV          string `json:"iv,omitempty"`
+		IsEncrypted bool   `json:"encrypted,omitempty"`
 	}
 	msgs := []historyMessage{}
 	for rows.Next() {
 		var m historyMessage
-		var mediaURL, mediaType string
-		if err := rows.Scan(&m.Sender, &m.Content, &mediaURL, &mediaType, &m.Timestamp); err != nil {
+		var mediaURL, mediaType, iv string
+		var isEncrypted int
+		if err := rows.Scan(&m.Sender, &m.Content, &mediaURL, &mediaType, &m.Timestamp, &iv, &isEncrypted); err != nil {
 			http.Error(w, "scan error", http.StatusInternalServerError)
 			return
 		}
@@ -544,6 +691,8 @@ func handleHistory(w http.ResponseWriter, r *http.Request) {
 		m.Room = room
 		m.MediaURL = mediaURL
 		m.MediaType = mediaType
+		m.IV = iv
+		m.IsEncrypted = isEncrypted == 1
 		msgs = append(msgs, m)
 	}
 
@@ -588,6 +737,10 @@ func handleRooms(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Room == "" {
 			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if len(req.Room) > maxRoomNameLen {
+			http.Error(w, fmt.Sprintf("room name too long (max %d chars)", maxRoomNameLen), http.StatusBadRequest)
 			return
 		}
 		if _, err := db.Exec(
@@ -736,6 +889,12 @@ func handleMessage(raw []byte, conn *websocket.Conn, user string) {
 			Content: fmt.Sprintf("%s left the room", user),
 		}), conn, message.Room)
 
+	case protocol.TypeKeyRequest, protocol.TypeKeyDistribute:
+		// E2EE key exchange messages: broadcast to the room but never persist.
+		// Override sender to prevent spoofing; leave Content/PublicKey untouched.
+		message.Sender = user
+		hub.broadcastToRoom(message, conn, message.Room)
+
 	default:
 		log.Printf("unknown message type: %q", message.Type)
 	}
@@ -806,16 +965,212 @@ func handleDM(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	targetName := strings.ToLower(strings.TrimSpace(req.Username))
+	if targetName == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
 	var targetID int64
-	if err := db.QueryRow("SELECT user_id FROM users WHERE name = ?", req.Username).Scan(&targetID); err != nil {
+	if err := db.QueryRow("SELECT user_id FROM users WHERE name = ?", targetName).Scan(&targetID); err != nil {
 		http.Error(w, "user not found", http.StatusNotFound)
 		return
 	}
-	room := dmRoomName(username, req.Username)
+	room := dmRoomName(username, targetName)
 	db.Exec("INSERT OR IGNORE INTO user_rooms (user_id, room_name) VALUES (?, ?)", userID, room)
 	db.Exec("INSERT OR IGNORE INTO user_rooms (user_id, room_name) VALUES (?, ?)", targetID, room)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"room": room})
+}
+
+// handleKeys manages ECDH public keys for E2EE.
+//
+//	POST /keys  body: {"public_key":"<base64-spki>"}  → 204  (register/update own key)
+//	GET  /keys?username=<name>                         → {"public_key":"<base64-spki>"}
+func handleKeys(w http.ResponseWriter, r *http.Request) {
+	userID, ok := validateSessionParam(w, r)
+	if !ok {
+		return
+	}
+	switch r.Method {
+	case http.MethodPost:
+		var req struct {
+			PublicKey string `json:"public_key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PublicKey == "" {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		now := time.Now().UTC().Format(time.RFC3339)
+		if _, err := db.Exec(
+			`INSERT OR REPLACE INTO user_public_keys (user_id, public_key, uploaded_at) VALUES (?, ?, ?)`,
+			userID, req.PublicKey, now,
+		); err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+
+	case http.MethodGet:
+		username := r.URL.Query().Get("username")
+		if username == "" {
+			http.Error(w, "username required", http.StatusBadRequest)
+			return
+		}
+		var pubKey string
+		err := db.QueryRow(`
+			SELECT upk.public_key
+			FROM user_public_keys upk
+			JOIN users u ON u.user_id = upk.user_id
+			WHERE u.name = ?`, username).Scan(&pubKey)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"public_key": pubKey})
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleRoomKey manages per-user encrypted room keys for E2EE.
+//
+//	POST /room-key  body: {"room":"...","for_user":"...","encrypted_key":"...","key_iv":"...","sender_public_key":"..."}  → 204
+//	GET  /room-key?room=<name>  → {"encrypted_key":"...","key_iv":"...","sender_public_key":"..."}
+func handleRoomKey(w http.ResponseWriter, r *http.Request) {
+	userID, ok := validateSessionParam(w, r)
+	if !ok {
+		return
+	}
+	switch r.Method {
+	case http.MethodPost:
+		var req struct {
+			Room            string `json:"room"`
+			ForUser         string `json:"for_user"`
+			EncryptedKey    string `json:"encrypted_key"`
+			KeyIV           string `json:"key_iv"`
+			SenderPublicKey string `json:"sender_public_key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil ||
+			req.Room == "" || req.ForUser == "" || req.EncryptedKey == "" ||
+			req.KeyIV == "" || req.SenderPublicKey == "" {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		// Verify the posting user is in the room.
+		var memberCount int
+		db.QueryRow("SELECT COUNT(*) FROM user_rooms WHERE user_id = ? AND room_name = ?", userID, req.Room).Scan(&memberCount)
+		if memberCount == 0 {
+			http.Error(w, "not a member of this room", http.StatusForbidden)
+			return
+		}
+		// Verify sender_public_key matches the authenticated user's registered key.
+		// This prevents a malicious room member from substituting a fake sender key
+		// to perform a man-in-the-middle attack on key distribution.
+		var registeredKey string
+		if err := db.QueryRow("SELECT public_key FROM user_public_keys WHERE user_id = ?", userID).Scan(&registeredKey); err != nil {
+			http.Error(w, "public key not registered — call POST /keys first", http.StatusBadRequest)
+			return
+		}
+		if req.SenderPublicKey != registeredKey {
+			http.Error(w, "sender_public_key does not match your registered key", http.StatusForbidden)
+			return
+		}
+		// Resolve the target user.
+		var targetID int64
+		if err := db.QueryRow("SELECT user_id FROM users WHERE name = ?", req.ForUser).Scan(&targetID); err != nil {
+			http.Error(w, "user not found", http.StatusNotFound)
+			return
+		}
+		// Verify the target user is also a member of the room.
+		var targetMemberCount int
+		db.QueryRow("SELECT COUNT(*) FROM user_rooms WHERE user_id = ? AND room_name = ?", targetID, req.Room).Scan(&targetMemberCount)
+		if targetMemberCount == 0 {
+			http.Error(w, "target user is not a member of this room", http.StatusForbidden)
+			return
+		}
+		if _, err := db.Exec(
+			`INSERT OR REPLACE INTO room_keys (room_name, user_id, encrypted_key, key_iv, sender_public_key)
+			 VALUES (?, ?, ?, ?, ?)`,
+			req.Room, targetID, req.EncryptedKey, req.KeyIV, req.SenderPublicKey,
+		); err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+
+	case http.MethodGet:
+		room := r.URL.Query().Get("room")
+		if room == "" {
+			http.Error(w, "room required", http.StatusBadRequest)
+			return
+		}
+		var encKey, keyIV, senderPubKey string
+		err := db.QueryRow(
+			`SELECT encrypted_key, key_iv, sender_public_key FROM room_keys WHERE room_name = ? AND user_id = ?`,
+			room, userID,
+		).Scan(&encKey, &keyIV, &senderPubKey)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"encrypted_key":     encKey,
+			"key_iv":            keyIV,
+			"sender_public_key": senderPubKey,
+		})
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleRoomMembers returns all members currently subscribed to a room.
+//
+//	GET /room/members?room=<name>  → {"members":["alice","bob"]}
+func handleRoomMembers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	userID, ok := validateSessionParam(w, r)
+	if !ok {
+		return
+	}
+	room := r.URL.Query().Get("room")
+	if room == "" {
+		http.Error(w, "room required", http.StatusBadRequest)
+		return
+	}
+	// Verify the requesting user is a member.
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM user_rooms WHERE user_id = ? AND room_name = ?", userID, room).Scan(&count)
+	if count == 0 {
+		http.Error(w, "not a member of this room", http.StatusForbidden)
+		return
+	}
+	rows, err := db.Query(
+		`SELECT u.name FROM users u JOIN user_rooms ur ON u.user_id = ur.user_id WHERE ur.room_name = ? ORDER BY u.name ASC`,
+		room,
+	)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	members := []string{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			http.Error(w, "scan error", http.StatusInternalServerError)
+			return
+		}
+		members = append(members, name)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string][]string{"members": members})
 }
 
 func main() {
@@ -843,24 +1198,31 @@ func main() {
 		log.Fatal("failed to init squad:", err)
 	}
 
-	http.HandleFunc("/register", handleRegister)
-	http.HandleFunc("/login", handleLogin)
-	http.HandleFunc("/rooms", handleRooms)
-	http.HandleFunc("/history", handleHistory)
-	http.HandleFunc("/users", handleUsers)
-	http.HandleFunc("/dm", handleDM)
-	http.HandleFunc("/squad", handleSquad)
-	http.HandleFunc("/squad/members", handleSquadMembers)
-	http.HandleFunc("/upload", handleUpload)
-	http.HandleFunc("/media/", handleMedia)
-	http.HandleFunc("/ws", handleConnection)
-	http.Handle("/", http.FileServer(http.Dir("./web")))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/register", handleRegister)
+	mux.HandleFunc("/login", handleLogin)
+	mux.HandleFunc("/logout", handleLogout)
+	mux.HandleFunc("/rooms", handleRooms)
+	mux.HandleFunc("/history", handleHistory)
+	mux.HandleFunc("/users", handleUsers)
+	mux.HandleFunc("/dm", handleDM)
+	mux.HandleFunc("/squad", handleSquad)
+	mux.HandleFunc("/squad/members", handleSquadMembers)
+	mux.HandleFunc("/upload", handleUpload)
+	mux.HandleFunc("/media/", handleMedia)
+	mux.HandleFunc("/keys", handleKeys)
+	mux.HandleFunc("/room-key", handleRoomKey)
+	mux.HandleFunc("/room/members", handleRoomMembers)
+	mux.HandleFunc("/ws", handleConnection)
+	mux.Handle("/", http.FileServer(http.Dir("./web")))
+
+	handler := securityHeaders(mux)
 
 	if *certFile != "" && *keyFile != "" {
 		fmt.Printf("server listening on %s (TLS)\n", *addr)
-		log.Fatal(http.ListenAndServeTLS(*addr, *certFile, *keyFile, nil))
+		log.Fatal(http.ListenAndServeTLS(*addr, *certFile, *keyFile, handler))
 	} else {
-		fmt.Printf("server listening on %s (plaintext)\n", *addr)
-		log.Fatal(http.ListenAndServe(*addr, nil))
+		fmt.Printf("server listening on %s (plaintext — consider running with -cert/-key for TLS)\n", *addr)
+		log.Fatal(http.ListenAndServe(*addr, handler))
 	}
 }
