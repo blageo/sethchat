@@ -59,6 +59,21 @@
             background: rgba(232, 126, 126, 0.06);
         }
 
+        .register-hint {
+            font-size: 0.78rem;
+            color: var(--subtle);
+            text-align: center;
+            margin-top: 0.5rem;
+            background: transparent;
+            border: none;
+            padding: 0;
+            line-height: 1.5;
+        }
+
+        #toggleRegister { color: var(--accent); }
+
+        #fileInput { display: none; }
+
         .field {
             display: flex;
             flex-direction: column;
@@ -246,7 +261,8 @@
             padding: 0 0.3rem;
         }
 
-        .room-item .leave-btn {
+        .room-item .leave-btn,
+        .room-item .settings-btn {
             background: transparent;
             color: var(--muted);
             font-size: 0.7rem;
@@ -255,8 +271,22 @@
             transition: opacity 0.1s, color 0.1s;
         }
 
-        .room-item:hover .leave-btn { opacity: 1; }
+        .room-item:hover .leave-btn,
+        .room-item:hover .settings-btn { opacity: 1; }
         .room-item .leave-btn:hover { color: var(--danger); }
+        .room-item .settings-btn:hover { color: var(--accent); }
+
+        .danger-btn {
+            background: transparent;
+            border: 1px solid var(--danger);
+            color: var(--danger);
+            padding: 0.35rem 0.75rem;
+            font-size: 0.82rem;
+            cursor: pointer;
+            transition: background 0.1s;
+        }
+        .danger-btn:hover { background: rgba(232,126,126,0.1); }
+        .danger-btn:disabled { opacity: 0.4; cursor: default; }
 
         #addRoomBar {
             display: flex;
@@ -589,6 +619,24 @@
         }
 
         .member-item:last-child { border-bottom: none; }
+
+        .dm-picker-item { cursor: pointer; }
+
+        .modal-hint {
+            font-size: 0.82rem;
+            color: var(--subtle);
+            margin-bottom: 0.75rem;
+        }
+
+        .modal-status {
+            font-size: 0.78rem;
+            color: var(--accent);
+            margin-top: 0.5rem;
+        }
+
+        .modal-inline-btn { align-self: flex-start; }
+
+        .clickable-media { cursor: pointer; }
 
         .member-name { flex: 1; color: var(--text); }
 

@@ -21,8 +21,8 @@
             <input type="password" id="password" name="password" required autocomplete="current-password">
         </div>
         <button type="submit">Connect →</button>
-        <p style="font-size:0.78rem; color:var(--subtle); text-align:center; margin-top:0.5rem">
-            No account? <a href="#" id="toggleRegister" style="color:var(--accent)">Register</a>
+        <p class="register-hint">
+            No account? <a href="#" id="toggleRegister">Register</a>
         </p>
     </form>
 
@@ -65,7 +65,7 @@
                 <button id="clearMediaButton">✕</button>
             </div>
             <div id="inputBar">
-                <input type="file" id="fileInput" accept="image/*,video/*" style="display:none">
+                <input type="file" id="fileInput" accept="image/*,video/*">
                 <button id="attachButton" type="button" title="Attach media">&#128206;</button>
                 <input type="text" id="messageInput" placeholder="Message...">
                 <button id="sendButton">Send</button>

@@ -633,15 +633,35 @@ func saveMessage(m protocol.Message) {
 	}
 }
 
-// handleHistory returns the most recent chat messages for a room.
+// handleHistory returns or clears chat messages for a room.
 //
-//	GET /history?room=<name>&session=<sid>
-//	→ {"messages": [...]}  (chronological order, up to 50 messages)
+//	GET    /history?room=<name>&session=<sid>  → {"messages": [...]}
+//	DELETE /history?room=<name>&session=<sid>  → 204  (owner/admin only)
 func handleHistory(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+	switch r.Method {
+	case http.MethodDelete:
+		userID, ok := validateSessionParam(w, r)
+		if !ok {
+			return
+		}
+		if role := getUserRole(userID); role != "owner" && role != "admin" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		room := r.URL.Query().Get("room")
+		if room == "" {
+			http.Error(w, "room required", http.StatusBadRequest)
+			return
+		}
+		db.Exec("DELETE FROM messages WHERE room_name = ?", room)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	case http.MethodGet:
+	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
 	if _, ok := validateSessionParam(w, r); !ok {
 		return
 	}

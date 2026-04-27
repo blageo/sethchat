@@ -336,8 +336,9 @@
             }
 
             // No key on server for us yet.
-            if (histMsgs.length === 0) {
-                // First member in this room — generate and store a new room key.
+            const hasEncryptedHistory = histMsgs.some(m => m.encrypted)
+            if (histMsgs.length === 0 || !hasEncryptedHistory) {
+                // New room or pre-E2EE room with no encrypted messages — generate a fresh key.
                 const newKey = await E2EE.generateRoomKey()
                 await E2EE.storeRoomKey(roomName, newKey)
                 const { encrypted_key, key_iv } = await E2EE.encryptRoomKeyForUser(
@@ -422,6 +423,7 @@
         function renderSidebar() {
             const list = document.getElementById('roomList')
             list.innerHTML = ''
+            const canManage = squadInfo && (squadInfo.your_role === 'owner' || squadInfo.your_role === 'admin')
             for (const name of joinedRooms) {
                 if (name.startsWith('dm:')) continue
                 const count = unread[name] || 0
@@ -432,11 +434,18 @@
                     <span class="room-label">${escapeHtml(name)}</span>
                     <span class="room-end">
                         ${count ? `<span class="unread-badge">${count}</span>` : ''}
+                        ${canManage ? `<button class="settings-btn" title="room settings">⚙</button>` : ''}
                         <button class="leave-btn" title="leave">✕</button>
                     </span>
                 `
                 item.querySelector('.room-label').addEventListener('click', () => switchToRoom(name))
                 item.querySelector('.room-hash').addEventListener('click', () => switchToRoom(name))
+                if (canManage) {
+                    item.querySelector('.settings-btn').addEventListener('click', e => {
+                        e.stopPropagation()
+                        openRoomSettings(name)
+                    })
+                }
                 item.querySelector('.leave-btn').addEventListener('click', e => {
                     e.stopPropagation()
                     leaveRoom(name)
@@ -444,6 +453,28 @@
                 list.appendChild(item)
             }
             renderDMList()
+        }
+
+        function openRoomSettings(roomName) {
+            openModal(`#${escapeHtml(roomName)} settings`, `
+                <p class="modal-hint">Permanently deletes all messages. This cannot be undone.</p>
+                <button id="clearHistoryBtn" class="danger-btn">Clear message history</button>
+                <p id="clearHistoryMsg" class="modal-status"></p>
+            `)
+            document.getElementById('clearHistoryBtn').addEventListener('click', async () => {
+                if (!confirm(`Clear all message history for #${roomName}? This cannot be undone.`)) return
+                const res = await fetch(`/history?room=${encodeURIComponent(roomName)}&session=${sessionId}`, {
+                    method: 'DELETE',
+                })
+                if (res.ok) {
+                    messages[roomName] = []
+                    if (activeRoom === roomName) renderMessageList()
+                    document.getElementById('clearHistoryMsg').textContent = 'History cleared.'
+                    document.getElementById('clearHistoryBtn').disabled = true
+                } else {
+                    document.getElementById('clearHistoryMsg').textContent = 'Failed: ' + (await res.text()).trim()
+                }
+            })
         }
 
         // renderDMList rebuilds the #dmList element from DM entries in joinedRooms.
@@ -509,7 +540,7 @@
                         mediaHTML = `<div class="media-content">
                             <img src="${escapeHtml(message.mediaURL)}"
                                  alt="attached media"
-                                 onclick="window.open(this.src)">
+                                 class="clickable-media">
                         </div>`
                     }
                 }
@@ -526,6 +557,8 @@
                     ${bodyHTML}
                     ${mediaHTML}
                 `
+                const img = el.querySelector('.clickable-media')
+                if (img) img.addEventListener('click', () => window.open(img.src))
             } else if (message.type === 'system') {
                 el.classList.add('message', 'system')
                 el.textContent = message.content
@@ -662,11 +695,11 @@
             const res = await fetch(`/users?session=${sessionId}`)
             const data = await res.json()
             if (!data.users || data.users.length === 0) {
-                openModal('New Direct Message', '<p style="color:var(--subtle);font-size:0.82rem">No other members yet.</p>')
+                openModal('New Direct Message', '<p class="modal-hint">No other members yet.</p>')
                 return
             }
             const rows = data.users.map(u =>
-                `<div class="member-item dm-picker-item" data-name="${escapeHtml(u.name)}" style="cursor:pointer">
+                `<div class="member-item dm-picker-item" data-name="${escapeHtml(u.name)}">
                     <span class="member-name">@ ${escapeHtml(u.name)}</span>
                 </div>`
             ).join('')
@@ -741,8 +774,8 @@
                     <label>Description</label>
                     <input type="text" id="settingsDesc" value="${escapeHtml(squadInfo.description)}">
                 </div>
-                <button id="saveSettingsBtn" style="align-self:flex-start">Save</button>
-                <p id="settingsMsg" style="font-size:0.78rem;color:var(--accent)"></p>
+                <button id="saveSettingsBtn" class="modal-inline-btn">Save</button>
+                <p id="settingsMsg" class="modal-status"></p>
             `)
             document.getElementById('saveSettingsBtn').addEventListener('click', async () => {
                 const name = document.getElementById('settingsName').value.trim()
