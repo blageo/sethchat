@@ -143,6 +143,19 @@ const E2EE = (() => {
         await dbPut(`room-key-${roomName}`, key)
     }
 
+    // deleteRoomKey removes a room's key from IndexedDB.
+    // Called when a room is deleted to prevent the stale key from being reused
+    // if a room with the same name is later created.
+    async function deleteRoomKey(roomName) {
+        const db = await openDB()
+        return new Promise((resolve, reject) => {
+            const tx  = db.transaction(STORE, 'readwrite')
+            const req = tx.objectStore(STORE).delete(`room-key-${roomName}`)
+            req.onsuccess = () => resolve()
+            req.onerror   = e => reject(e.target.error)
+        })
+    }
+
     // encryptRoomKeyForUser wraps the room key for a recipient using the
     // ECDH-derived shared secret between our private key and their public key.
     // Returns { encrypted_key, key_iv } as base64 strings.
@@ -214,6 +227,7 @@ const E2EE = (() => {
         generateRoomKey,
         getRoomKey,
         storeRoomKey,
+        deleteRoomKey,
         encryptRoomKeyForUser,
         decryptRoomKey,
         encryptMessage,

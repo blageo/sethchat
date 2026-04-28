@@ -86,6 +86,14 @@ func (h *Hub) roomsForConn(conn *websocket.Conn) []string {
 	return rooms
 }
 
+// deleteRoom removes an entire room from the hub, disconnecting all in-memory members.
+// DB cleanup is the caller's responsibility.
+func (h *Hub) deleteRoom(room string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.clients, room)
+}
+
 // removeFromAll removes conn from every room. Called on disconnect to ensure
 // no stale connections remain in the hub.
 func (h *Hub) removeFromAll(conn *websocket.Conn) {
@@ -387,6 +395,21 @@ func getUserRole(userID int64) string {
 		return "member"
 	}
 	return role
+}
+
+// isRoomOwner reports whether userID is the owner of roomName.
+// A user owns a room if they created it (rooms.created_by = userID).
+// For legacy rooms with no ownership record, the squad owner is the fallback.
+func isRoomOwner(userID int64, roomName string) bool {
+	var createdBy int64
+	err := db.QueryRow("SELECT created_by FROM rooms WHERE room_name = ?", roomName).Scan(&createdBy)
+	if err == nil {
+		return createdBy == userID
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return getUserRole(userID) == "owner"
+	}
+	return false
 }
 
 // handleRegister creates a new user account.
@@ -748,8 +771,17 @@ func handleRooms(w http.ResponseWriter, r *http.Request) {
 			}
 			rooms = append(rooms, name)
 		}
+		ownedRooms := []string{}
+		for _, room := range rooms {
+			if !strings.HasPrefix(room, "dm:") && isRoomOwner(userID, room) {
+				ownedRooms = append(ownedRooms, room)
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string][]string{"rooms": rooms})
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"rooms":       rooms,
+			"owned_rooms": ownedRooms,
+		})
 
 	case http.MethodPost:
 		var req struct {
@@ -769,7 +801,13 @@ func handleRooms(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return
 		}
-		w.WriteHeader(http.StatusNoContent)
+		// Record creator as owner for non-DM rooms (INSERT OR IGNORE preserves existing owner).
+		if !strings.HasPrefix(req.Room, "dm:") {
+			db.Exec("INSERT OR IGNORE INTO rooms (room_name, created_by) VALUES (?, ?)", req.Room, userID)
+		}
+		owner := !strings.HasPrefix(req.Room, "dm:") && isRoomOwner(userID, req.Room)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{"owner": owner})
 
 	case http.MethodDelete:
 		var req struct {
@@ -777,6 +815,11 @@ func handleRooms(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Room == "" {
 			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		// Non-DM rooms cannot be left; owners must delete the room via DELETE /room.
+		if !strings.HasPrefix(req.Room, "dm:") {
+			http.Error(w, "room cannot be left; the room owner may delete it", http.StatusForbidden)
 			return
 		}
 		if _, err := db.Exec(
@@ -790,6 +833,59 @@ func handleRooms(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// handleDeleteRoom permanently removes a room and all its DB records.
+// Only the room owner may delete a room; DM rooms are excluded.
+//
+//	DELETE /room?room=<name>&session=<sid>  → 204
+func handleDeleteRoom(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	userID, ok := validateSessionParam(w, r)
+	if !ok {
+		return
+	}
+	room := r.URL.Query().Get("room")
+	if room == "" {
+		http.Error(w, "room required", http.StatusBadRequest)
+		return
+	}
+	if strings.HasPrefix(room, "dm:") {
+		http.Error(w, "DM conversations cannot be deleted this way", http.StatusBadRequest)
+		return
+	}
+	if !isRoomOwner(userID, room) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Notify connected members before removing the room from the hub.
+	hub.broadcastToRoom(stamp(protocol.Message{
+		Type:    protocol.TypeSystem,
+		Room:    room,
+		Content: "this room has been deleted",
+	}), nil, room)
+	hub.deleteRoom(room)
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+	tx.Exec("DELETE FROM messages WHERE room_name = ?", room)
+	tx.Exec("DELETE FROM room_keys WHERE room_name = ?", room)
+	tx.Exec("DELETE FROM user_rooms WHERE room_name = ?", room)
+	tx.Exec("DELETE FROM rooms WHERE room_name = ?", room)
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleConnection upgrades an HTTP request to a WebSocket and manages the
@@ -902,6 +998,10 @@ func handleMessage(raw []byte, conn *websocket.Conn, user string) {
 		}), conn, message.Room)
 
 	case protocol.TypeLeaveRoom:
+		// Non-DM rooms cannot be left; they are deleted by their owner via DELETE /room.
+		if !strings.HasPrefix(message.Room, "dm:") {
+			return
+		}
 		hub.removeFromRoom(conn, message.Room)
 		hub.broadcastToRoom(stamp(protocol.Message{
 			Type:    protocol.TypeSystem,
@@ -1232,6 +1332,7 @@ func main() {
 	mux.HandleFunc("/media/", handleMedia)
 	mux.HandleFunc("/keys", handleKeys)
 	mux.HandleFunc("/room-key", handleRoomKey)
+	mux.HandleFunc("/room", handleDeleteRoom)
 	mux.HandleFunc("/room/members", handleRoomMembers)
 	mux.HandleFunc("/ws", handleConnection)
 	mux.Handle("/", http.FileServer(http.Dir("./web")))

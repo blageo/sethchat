@@ -30,6 +30,7 @@
         let ownPubKeyB64      = null         // base64(SPKI) of own public key
         const pendingKeyRooms = new Set()    // rooms waiting for key distribution
         const messageBuffer   = {}           // { [roomName]: Message[] } — encrypted msgs buffered until key arrives
+        const ownedRooms      = new Set()    // rooms created/owned by the current user
 
         // ── Login / Register ──────────────────────────────
 
@@ -106,6 +107,9 @@
                 // Restore saved rooms from the server, then join each one.
                 const roomsRes = await fetch(`/rooms?session=${sessionId}`)
                 const roomsData = await roomsRes.json()
+                for (const r of (roomsData.owned_rooms || [])) {
+                    ownedRooms.add(r)
+                }
                 for (const roomName of roomsData.rooms) {
                     await joinRoom(roomName)
                 }
@@ -234,6 +238,27 @@
                     }
                 }
 
+                // ── Room deletion by owner ───────────────────────────────────
+
+                if (message.type === 'system' && message.content === 'this room has been deleted' && msgRoom) {
+                    await E2EE.deleteRoomKey(msgRoom)
+                    ownedRooms.delete(msgRoom)
+                    joinedRooms.delete(msgRoom)
+                    delete messages[msgRoom]
+                    renderSidebar()
+                    if (activeRoom === msgRoom) {
+                        const remaining = [...joinedRooms]
+                        activeRoom = remaining.length > 0 ? remaining[0] : null
+                        if (activeRoom) {
+                            switchToRoom(activeRoom)
+                        } else {
+                            headerRoom.textContent = ''
+                            messageList.innerHTML = ''
+                        }
+                    }
+                    return
+                }
+
                 // ── Key rotation on member leave ─────────────────────────────
 
                 if (message.type === 'system' && message.content && message.content.endsWith(' left the room')) {
@@ -272,11 +297,17 @@
                 switchToRoom(roomName)
                 return
             }
-            await fetch(`/rooms?session=${sessionId}`, {
+            const postRes = await fetch(`/rooms?session=${sessionId}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ room: roomName }),
             })
+            if (postRes.ok) {
+                try {
+                    const postData = await postRes.json()
+                    if (postData.owner) ownedRooms.add(roomName)
+                } catch (_) {}
+            }
             conn.send(JSON.stringify({ type: 'joinRoom', room: roomName }))
             joinedRooms.add(roomName)
 
@@ -366,9 +397,8 @@
             }
         }
 
-        // leaveRoom removes the room from the server, sends a WS leaveRoom message,
-        // and updates local state + sidebar. If the active room is left, auto-
-        // switches to the next available room (or clears the message pane).
+        // leaveRoom closes a DM conversation for the current user only.
+        // Non-DM rooms cannot be left; use deleteRoom instead.
         async function leaveRoom(roomName) {
             await fetch(`/rooms?session=${sessionId}`, {
                 method: 'DELETE',
@@ -376,6 +406,33 @@
                 body: JSON.stringify({ room: roomName }),
             })
             conn.send(JSON.stringify({ type: 'leaveRoom', room: roomName }))
+            joinedRooms.delete(roomName)
+            delete messages[roomName]
+            renderSidebar()
+            if (activeRoom === roomName) {
+                const remaining = [...joinedRooms]
+                activeRoom = remaining.length > 0 ? remaining[0] : null
+                if (activeRoom) {
+                    switchToRoom(activeRoom)
+                } else {
+                    headerRoom.textContent = ''
+                    messageList.innerHTML = ''
+                }
+            }
+        }
+
+        // deleteRoom permanently deletes a room and all its data. Owner only.
+        async function deleteRoom(roomName) {
+            if (!confirm(`Delete #${roomName}? This permanently removes all messages and cannot be undone.`)) return
+            const res = await fetch(`/room?room=${encodeURIComponent(roomName)}&session=${sessionId}`, {
+                method: 'DELETE',
+            })
+            if (!res.ok) {
+                alert('Delete failed: ' + (await res.text()).trim())
+                return
+            }
+            await E2EE.deleteRoomKey(roomName)
+            ownedRooms.delete(roomName)
             joinedRooms.delete(roomName)
             delete messages[roomName]
             renderSidebar()
@@ -427,6 +484,7 @@
             for (const name of joinedRooms) {
                 if (name.startsWith('dm:')) continue
                 const count = unread[name] || 0
+                const isOwner = ownedRooms.has(name)
                 const item = document.createElement('div')
                 item.className = 'room-item' + (name === activeRoom ? ' active' : '')
                 item.innerHTML = `
@@ -435,7 +493,7 @@
                     <span class="room-end">
                         ${count ? `<span class="unread-badge">${count}</span>` : ''}
                         ${canManage ? `<button class="settings-btn" title="room settings">⚙</button>` : ''}
-                        <button class="leave-btn" title="leave">✕</button>
+                        ${isOwner ? `<button class="delete-btn" title="delete room">✕</button>` : ''}
                     </span>
                 `
                 item.querySelector('.room-label').addEventListener('click', () => switchToRoom(name))
@@ -446,10 +504,12 @@
                         openRoomSettings(name)
                     })
                 }
-                item.querySelector('.leave-btn').addEventListener('click', e => {
-                    e.stopPropagation()
-                    leaveRoom(name)
-                })
+                if (isOwner) {
+                    item.querySelector('.delete-btn').addEventListener('click', e => {
+                        e.stopPropagation()
+                        deleteRoom(name)
+                    })
+                }
                 list.appendChild(item)
             }
             renderDMList()

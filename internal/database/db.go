@@ -86,6 +86,11 @@ func Open(path string) (*sql.DB, error) {
 		PRIMARY KEY (room_name, user_id),
 		FOREIGN KEY (user_id) REFERENCES users(user_id)
 	);
+	CREATE TABLE IF NOT EXISTS rooms (
+		room_name  TEXT PRIMARY KEY,
+		created_by INTEGER NOT NULL,
+		FOREIGN KEY (created_by) REFERENCES users(user_id)
+	);
 	`)
 
 	if err != nil {
